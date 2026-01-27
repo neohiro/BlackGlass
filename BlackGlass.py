@@ -66,11 +66,13 @@ class variable:
     data = b""
     type = 0
     def __init__(self, ty = 1, data = b""):
-        # Corrected for explicit bytes passing from sender (e.g., chat message with null-terminator)
+        
+        # --- FIX: Ensure Correct Latin-1 Encoding and Null Termination ---
         if type(data) == bytes:
             self.data = data
         elif type(data) == str:
             # FIX: Only encode and null-terminate if the string does *not* already end with \x00.
+            # Use latin-1 for protocol strings
             if not data.endswith('\x00'):
                 self.data = (data + '\x00').encode("latin-1")
             else:
@@ -80,6 +82,7 @@ class variable:
             self.data = bytes(data)
         else:
             self.data = type(data).encode("utf-8")
+        # --- END FIX ---
             
         self.type = ty
         if ty == 1:
@@ -734,6 +737,19 @@ class ImprovedTerseObjectUpdate(BaseMessage):
     }
 registerMessage(ImprovedTerseObjectUpdate)
 
+# --- KICKUSER PACKET ---
+class KickUser(BaseMessage):
+    # This is a high-frequency (2), trusted message
+    name = "KickUser"; id = 244; freq = 2; trusted = True; zero_coded = True
+    blocks = [("UserInfo", 1), ("TargetBlock", 1)]
+    structure = {
+        "UserInfo": [("AgentID", "LLUUID"), ("SessionID", "LLUUID")],
+        # Reason field uses Variable, type 2, which allows for longer messages
+        "TargetBlock": [("Reason", "Variable", 2), ("TargetID", "LLUUID")]
+    }
+registerMessage(KickUser)
+# --- END KICKUSER PACKET ---
+
 
 # ==========================================
 # SECTION 5: PACKET HANDLING (packet.py)
@@ -802,7 +818,7 @@ class Packet:
             self.sequence = sequence
             self.body = message
             self.acks = acks
-            self.reliable = getattr(message, 'reliable', False) # Set reliable from message metadata
+            self.reliable = getattr(message, 'trusted', False) # Set reliable from message metadata
             if reliable: self.reliable = True # Override if explicitly set as reliable
             if resent: self.resent = True
 
@@ -891,11 +907,21 @@ class RegionClient:
     agent_y = 128.0
     agent_z = 30.0
     agent_rot_z = 0.0 # yaw only for minimap (radians)
+    
+    # NEW: Global Grid Coordinates for Map Fetching
+    grid_x = 1000
+    grid_y = 1000
+    local_id = 0 # NEW: Store the simulator-assigned LocalID for the agent
+
+    # NEW: List to store positions of other avatars [(x, y, z), ...]
+    other_avatars = []
 
     # MODIFIED: Added log_callback to constructor
     def __init__(self, loginToken, host="0.0.0.0", port=0, debug=False, log_callback=None):
         self.debug = debug
         self.log_callback = log_callback if log_callback is not None else lambda msg: None
+        self.other_avatars = [] # Initialize list
+        self.local_id = 0 # Reset local_id
         
         if loginToken.get("login") != "true":
             raise ConnectionError("Unable to log into simulator: %s" % loginToken.get("message", "Unknown"))
@@ -913,6 +939,35 @@ class RegionClient:
         
         # The circuit_code from login token is a string (e.g., "1234567"), need to pack the integer value
         self.circuit_code = int(loginToken["circuit_code"])
+
+        # Extract initial region grid coordinates (in meters) and convert to tile coordinates
+        # Default is Da Boom (1000, 1000) if missing
+        
+        # DEBUG: Dump token keys to check for region_x/y existence
+        self.log_callback(f"[CHAT] Login Token Keys: {list(loginToken.keys())}")
+        
+        try:
+            val_x = loginToken.get("region_x", 0)
+            val_y = loginToken.get("region_y", 0)
+            self.log_callback(f"[CHAT] Token Raw X: {val_x} ({type(val_x)}), Y: {val_y} ({type(val_y)})")
+            
+            r_x = int(float(val_x))
+            r_y = int(float(val_y))
+        except Exception as e:
+            self.log_callback(f"[CHAT] Coord Parse Error: {e}")
+            r_x = 0; r_y = 0
+            
+        if r_x > 0 and r_y > 0:
+            self.grid_x = r_x // 256
+            self.grid_y = r_y // 256
+        else:
+            # If coordinates are missing, we default to 1000, 1000 but log a warning
+            self.log_callback("[CHAT] Warning: Region coordinates missing/invalid. Defaulting to (1000, 1000).")
+            self.grid_x = 1000
+            self.grid_y = 1000
+            
+        self.log_callback(f"[CHAT] Using Grid Coords: {self.grid_x}, {self.grid_y}")
+        
         
         self.last_circuit_send = 0 # Forces an immediate send on first loop iteration
 
@@ -991,6 +1046,7 @@ class RegionClient:
         self.log(f"Sent TeleportLocationRequest to handle {region_handle}")
         return True
 
+    # MODIFIED: Logic added to trigger MAP_FETCH_TRIGGER on RegionHandshake
     def handleInternalPackets(self, pck):
         if not hasattr(pck.body, 'name'): return
         
@@ -1017,37 +1073,70 @@ class RegionClient:
                                 self.teleport_lookup_event.set() # Signal the waiting thread
                             return
             
-        elif pck.body.name == "ImprovedTerseObjectUpdate":
-            # NEW: Extract own agent position from ImprovedTerseObjectUpdate
+        elif pck.body.name == "ObjectUpdate":
+            # Capture LocalID from ObjectUpdate to enable Terse updates
             for block in pck.body.ObjectData:
-                # Check if the object ID matches our Agent ID
-                # The first 4 bytes of the UUID are the Local ID
-                if block["ID"] == struct.unpack("<I", self.agent_id.bytes[:4])[0]: 
-                    data = block["Data"].data # The Fixed length 46-byte block
-                    
-                    # *** FIX: Corrected position extraction for Terse Update ***
-                    # Terse Object Update uses 3 U16 for XY and a U16 for Z.
-                    pos_x = struct.unpack("<H", data[7:9])[0] # Region X (0-65535, but capped at 256)
-                    pos_y = struct.unpack("<H", data[9:11])[0] # Region Y (0-65535, but capped at 256)
-                    pos_z = struct.unpack("<H", data[11:13])[0] # Z (meter * 256.0)
-                    
-                    # 16-27 (12 bytes): Rotation (X, Y, Z in S16) - for Z rotation (yaw) only
-                    rot_z_short = struct.unpack("<h", data[22:24])[0] # S16 for Z component (yaw)
-                    
-                    # Convert to actual values:
-                    self.agent_x = pos_x / 256.0
-                    self.agent_y = pos_y / 256.0
-                    self.agent_z = pos_z / 256.0
-                    
-                    # Convert S16 rotation to radians: (Value / 32768.0) * pi
-                    # This is complex and usually requires a table. A simple approximation:
-                    # Let's use 2*pi for the full circle.
-                    self.agent_rot_z = (rot_z_short / 32768.0) * math.pi * 2.0 
-                    # Ensure it's in the [0, 2*pi) range if needed.
-                    
-                    # Notify the UI to redraw the minimap
-                    self.log_callback("MINIMAP_UPDATE")
+                # Check if this object is ME
+                # Note: FullID might be under 'FullID' or similar depending on the block type
+                full_id = getattr(block, 'FullID', None)
+                if full_id == self.agent_id:
+                    self.local_id = block["ID"]
+                    self.log_callback(f"[CHAT] Agent LocalID Captured: {self.local_id}")
                     break
+
+        elif pck.body.name == "ImprovedTerseObjectUpdate":
+            for block in pck.body.ObjectData:
+                # Match against the captured LocalID or heuristic
+                is_me = False
+                if self.local_id != 0:
+                    is_me = (block["ID"] == self.local_id)
+                else:
+                    is_me = (block["ID"] == struct.unpack("<I", self.agent_id.bytes[:4])[0])
+                
+                if is_me:
+                    data = block["Data"].data 
+                    
+                    if len(data) >= 12:
+                        try:
+                            # Standard Avatar Interpretation (Offset 1, 12 bytes float)
+                            if len(data) >= 13:
+                                px, py, pz = struct.unpack("<fff", data[1:13])
+                                # Normalizing: if values are > 256, they are likely global.
+                                # Region local is always 0.0-256.0.
+                                if px > 256: px %= 256
+                                if py > 256: py %= 256
+                                
+                                self.agent_x, self.agent_y = px, py
+                                self.log_callback(f"[CHAT] Own Pos: {px:.1f}, {py:.1f}")
+                                self.log_callback("MINIMAP_UPDATE")
+                                break
+                            
+                            # Compressed Interpretation (Offset 0, 4 bytes U16)
+                            px_raw, py_raw = struct.unpack("<HH", data[0:4])
+                            px, py = px_raw / 256.0, py_raw / 256.0
+                            self.agent_x, self.agent_y = px, py
+                            self.log_callback(f"[CHAT] Own Pos (comp): {px:.1f}, {py:.1f}")
+                            self.log_callback("MINIMAP_UPDATE")
+                        except:
+                            pass
+                    break
+        
+        elif pck.body.name == "CoarseLocationUpdate":
+            # Handle other avatars for minimap
+            new_avatars = []
+            
+            # The sim typically sends 'Location' block.
+            location_blocks = getattr(pck.body, 'Location', [])
+            if not location_blocks:
+                location_blocks = getattr(pck.body, 'AgentData', [])
+            
+            for block in location_blocks:
+                if 'X' in block and 'Y' in block:
+                    new_avatars.append((block['X'], block['Y'], 0))
+                
+            self.other_avatars = new_avatars
+            self.log_callback(f"[CHAT] Received {len(self.other_avatars)} avatar dots.")
+            self.log_callback("MINIMAP_UPDATE")
 
         elif pck.body.name == "StartPingCheck":
             msg = getMessageByName("CompletePingCheck")
@@ -1070,18 +1159,31 @@ class RegionClient:
             msg.RegionInfo["Flags"] = 0
             self.send(msg)
             
+            # Send initial state information
             self.throttle()
             self.setFOV()
             self.setWindowSize()
             
+            # --- RECOMMENDED FIX: Send a reliable AgentUpdate immediately post-handshake ---
+            # This confirms the client's state and location, often resolving a silent sim info deadlock.
+            self.agentUpdate(controls=0, reliable=True)
+            # --- END RECOMMENDED FIX ---
+            
             # --- MAP FETCH TRIGGER ---
-            if PIL_AVAILABLE: # Only trigger map fetch if PIL is installed
+            # Trigger map fetch whenever a RegionHandshake is successfully processed.
+            if PIL_AVAILABLE: 
                 self.log_callback("MAP_FETCH_TRIGGER", self.sim['name'])
             # --- END MAP FETCH TRIGGER ---
             
             # --- FIX: Send the successful login status to the UI ---
             self.log_callback("HANDSHAKE_COMPLETE", self.sim['name'])
             # --- END FIX ---
+            
+        # --- KICKUSER HANDLING (NEW) ---
+        elif pck.body.name == "KickUser":
+            reason = safe_decode_llvariable(pck.body.TargetBlock.get('Reason', 'Unknown reason from sim.'))
+            self.log_callback("KICKED", reason)
+        # --- END KICKUSER HANDLING ---
 
         if pck.reliable:
             self.acks.append(pck.sequence)
@@ -1282,16 +1384,85 @@ class SecondLifeAgent:
                 # Handle map fetch request triggered by RegionClient
                 _, region_name = message.split(", ", 1)
                 self.ui_callback("map_fetch_request", region_name.strip())
-                
+
+            # --- DEBUG NOTIFICATION HANDLER ---
+            elif message.startswith("[NOTIFICATION]"):
+                 # Direct message to notification area
+                 clean_msg = message.replace("[NOTIFICATION]", "").strip()
+                 self.ui_callback("notification", clean_msg)
+
             # --- FIX: New Handshake Complete Handler ---
-            elif message.startswith("HANDSHAKE_COMPLETE"):
+            if message.startswith("HANDSHAKE_COMPLETE"):
+                # We still update status/progress here for immediate feedback
                 _, region_name = message.split(", ", 1)
                 self.ui_callback("status", f"🟢 Successfully logged in to {region_name.strip()}!")
                 self.ui_callback("progress", ("RegionHandshake Received", 100))
-            # --- END FIX ---
+                
+                # REMOVED: Triggering map fetch here is race-prone. 
+                # It is now handled in ChatTab.__init__ to ensure UI readiness.
+                    
+            # --- KICKED LOG HANDLER (NEW) ---
+            elif message.startswith("KICKED"):
+                _, reason = message.split(", ", 1)
+                self.ui_callback("status", f"🔴 Kicked: {reason.strip()}")
+                self.running = False # Stop the event loop upon kick
                 
             else:
                 self.debug_callback(message)
+
+    # ... (rest of class) ...
+
+    # MODIFIED: Worker thread target for map image fetching - CLEANED
+    def _fetch_map_image_task(self, region_name):
+        try:
+            # Current grid coordinates
+            gx = self.client.grid_x
+            gy = self.client.grid_y
+            
+            # Use the proven URL format directly
+            url = f"https://map.secondlife.com/map-1-{gx}-{gy}-objects.jpg"
+            
+            # Proven headers
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+            
+            # Proven SSL Context
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            
+            request = urllib.request.Request(url, headers=headers)
+            
+            with urllib.request.urlopen(request, timeout=15, context=ctx) as response:
+                if response.getcode() == 200:
+                    map_data = response.read()
+                    
+                    if len(map_data) > 2000:
+                        self.ui_callback("map_image_fetched", map_data)
+                    else:
+                        print(f"Map data too small: {len(map_data)}")
+                else:
+                    print(f"Map HTTP Error: {response.getcode()}")
+
+        except Exception as e:
+            # Catch ANY crash in the thread
+            error_msg = f"{type(e).__name__}: {e}"
+            print(f"MAP THREAD CRASH: {error_msg}")
+            self.ui_callback("status", f"⚠️ Map Error: {error_msg}")
+            self.ui_callback("map_image_fetched", None)
+            
+    def fetch_map(self, region_name):
+        """Public entry point for fetching the map image."""
+        if not PIL_AVAILABLE:
+            self.ui_callback("chat", "--- Map Debug: PIL NOT INSTALLED/DETECTED ---")
+            self.ui_callback("map_image_fetched", None) 
+            return
+        
+        if not self.running:
+            return
+            
+        threading.Thread(target=self._fetch_map_image_task, args=(region_name,), daemon=True).start()
 
     def _event_handler(self):
         """Runs in a separate thread to constantly check for new grid events."""
@@ -1375,7 +1546,9 @@ class SecondLifeAgent:
                     self.client.send_complete_movement() 
                     
                     time.sleep(0.1) 
-                    self.client.agentUpdate(controls=self.client.controls_once|self.client.controls, reliable=True)
+                    # NOTE: This AgentUpdate is now redundant as a RELIABLE one is sent in handleInternalPackets, 
+                    # but we keep it here to ensure quick non-reliable state assertion.
+                    self.client.agentUpdate(controls=self.client.controls_once|self.client.controls, reliable=False) 
 
                 # --- Handle Chat ---
                 elif packet_name == "ChatFromSimulator":
@@ -1409,7 +1582,11 @@ class SecondLifeAgent:
                         region_name = safe_decode_llvariable(offer.get("RegionName", "Unknown Region"))
                         l_cost = offer.get("L$Cost", 0)
                         
+                        # Extract RegionHandle (U64) to get coordinates early (optional usage)
+                        region_handle = offer.get("RegionHandle", 0)
+
                         # Send offer data to the UI thread
+
                         self.ui_callback("teleport_offer", {
                             "id": teleport_id,
                             "region": region_name,
@@ -1418,6 +1595,17 @@ class SecondLifeAgent:
                 
                 # --- General Connection Messages ---
                 elif packet_name == "TeleportFinish":
+                    # Update coordinates from the handle
+                    if hasattr(packet.body, 'Info'):
+                        handle = packet.body.Info.get("RegionHandle", 0)
+                        if handle:
+                            # Handle is a 64-bit int: y grid (in meters) << 32 | x grid (in meters)
+                            w_y = handle >> 32
+                            w_x = handle & 0xFFFFFFFF
+                            self.client.grid_x = w_x // 256
+                            self.client.grid_y = w_y // 256
+                            self.log(f"TeleportFinish: Updated grid coords to {self.client.grid_x}, {self.client.grid_y}")
+
                     self.ui_callback("status", "🚀 Teleport finished! Starting handshake in new region...")
                     # The network thread will now start the handshake process with the new region.
                     # Clear handshake state to trigger new handshake process
@@ -1531,6 +1719,8 @@ class SecondLifeAgent:
         msg.AgentData["AgentID"] = self.agent_id
         msg.AgentData["SessionID"] = self.session_id
         
+        # --- CHAT FIX: Variable Type 2 is correct, relying on variable.__init__ for latin-1 and null-termination ---
+        # The string must be encoded with latin-1 and null-terminated. The variable class handles this correctly.
         msg.ChatData["Message"] = variable(2, message) 
         
         msg.ChatData["Type"] = chat_type
@@ -1564,16 +1754,32 @@ class SecondLifeAgent:
     # MODIFIED: Worker thread target for map image fetching with new robust fallbacks
     def _fetch_map_image_task(self, region_name):
         # 1. Prepare region name for URL (underscores for spaces)
+        # Use simple unquoted version for the tile name part
         region_name_url = urllib.parse.quote(region_name.strip().replace(' ', '_')) 
         
+        # *** NEW: Add a small delay for map server processing ***
+        time.sleep(2.0)
+        
         # 2. Define multiple URLs with fallback logic
-        # *** FIX: Using the most reliable map service URL structure (SL official) ***
+        # *** FIX: Using robust coordinate-based URLs as primary ***
+        
+        # Current grid coordinates
+        gx = self.client.grid_x
+        gy = self.client.grid_y
+        
         urls_to_try = [
-            # Primary: Robust coordinate-based format (most current viewers use this)
+            # Primary: Standard coordinate-based format (Zoom level 1) - FORCE HTTPS
+            # https://map.secondlife.com/map-1-{x}-{y}-objects.jpg
+            f"https://map.secondlife.com/map-1-{gx}-{gy}-objects.jpg",
+            
+            # Fallback 0: HTTP version (in case of SSL issues)
+            f"http://map.secondlife.com/map-1-{gx}-{gy}-objects.jpg",
+            
+            # Fallback 1: Robust coordinate-based format 
             f"https://map.secondlife.com/map/secondlife/{region_name_url}/128/128/1000/256x256.jpg", 
-            # Fallback 1: Simplified URL on map domain (sometimes works via redirect)
+            # Fallback 2: Simplified URL on map domain (often redirects to the primary)
             f"https://map.secondlife.com/map/secondlife/{region_name_url}.jpg",
-            # Fallback 2: Older world domain simplified format (as a last resort)
+            # Fallback 3: Older world domain simplified format (as a last resort)
             f"https://world.secondlife.com/map/secondlife/{region_name_url}.jpg" 
         ]
         
@@ -1581,8 +1787,9 @@ class SecondLifeAgent:
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
 
+        last_error = ""
+
         for i, map_url in enumerate(urls_to_try):
-            self.log(f"Attempting map fetch ({i+1}/{len(urls_to_try)}) from: {map_url}")
             try:
                 request = urllib.request.Request(map_url, headers=headers)
                 
@@ -1591,28 +1798,32 @@ class SecondLifeAgent:
                     if response.getcode() == 200:
                         map_data = response.read()
                         # A valid map image should be significantly larger than a few bytes
-                        if len(map_data) > 1000: 
-                            self.log(f"Map image fetched successfully ({len(map_data)} bytes) from {map_url}.")
+                        # Error images or small placeholders are often < 2KB
+                        if len(map_data) > 2000: 
                             self.ui_callback("map_image_fetched", map_data)
                             return # Success!
                         else:
-                            self.log(f"Map fetch failed: Image data from {map_url} was too small or possibly an error image.")
+                            msg = f"Map fetch size too small ({len(map_data)} bytes) from {map_url}"
+                            last_error = msg
                             # Continue to next URL
                     else:
-                        self.log(f"Map fetch failed with HTTP status code {response.getcode()} for {map_url}.")
+                        msg = f"HTTP {response.getcode()} from {map_url}"
+                        last_error = msg
                         # Continue to next URL
 
             except urllib.error.HTTPError as e:
-                # Log specific HTTP errors (like 404 Not Found)
-                self.log(f"HTTP Error {e.code} fetching map image from {map_url}: {e.reason}")
+                # *** MODIFIED LOGGING: Log specific HTTP error ***
+                error_msg = f"HTTP Error {e.code} fetching map image from {map_url}: {e.reason}"
+                last_error = f"HTTP {e.code}"
                 # Continue to next URL
             except Exception as e:
-                # Log general network errors (like timeouts, SSL errors)
-                self.log(f"General Error fetching map image from {map_url}: {type(e).__name__}: {e}")
+                # *** MODIFIED LOGGING: Log general network errors ***
+                error_msg = f"General Error fetching map image from {map_url}: {type(e).__name__}: {e}"
+                last_error = str(e)
                 # Continue to next URL
         
         # 3. If all attempts fail
-        self.log(f"All map fetch attempts for {region_name} failed. Region might be offline or map service denied the request.")
+        self.ui_callback("status", f"⚠️ Map unavailable. ({last_error})")
         self.ui_callback("map_image_fetched", None)
             
     def fetch_map(self, region_name):
@@ -1698,6 +1909,13 @@ class SecondLifeAgent:
 
         # 3. Process result and send TeleportLocationRequest
         region_handle = result_block["Handle"]
+        
+        # Update our client's expected destination coordinates immediately
+        # (Handle is y << 32 | x)
+        w_y = region_handle >> 32
+        w_x = region_handle & 0xFFFFFFFF
+        self.client.grid_x = w_x // 256
+        self.client.grid_y = w_y // 256
         
         self.log(f"Region lookup success: Handle={region_handle}, Sim Tile X={result_block['X']}, Y={result_block['Y']}")
         
@@ -2088,14 +2306,33 @@ class MinimapCanvas(tk.Canvas):
         else:
             # General placeholder when map is not loaded or failed
             self.create_rectangle(0, 0, width, height, fill='#303030', outline='#444444')
+            
+            # --- FIX: Show debug info on the canvas ---
+            gx = getattr(self.agent.client, 'grid_x', '?')
+            gy = getattr(self.agent.client, 'grid_y', '?')
+            debug_text = f"Map Unavailable\nGrid: {gx}, {gy}"
+            
             if not PIL_AVAILABLE:
                 self.create_text(center_x, center_y, text="Pillow Missing!", fill='#FF0000')
             else:
-                self.create_text(center_x, center_y, text="Map Tile Unavailable", fill='#888888')
+                self.create_text(center_x, center_y, text=debug_text, fill='#888888', justify=tk.CENTER)
         # --- End Map Image/Placeholder Drawing ---
         
-        # --- Agent Drawing ---
-        if self.agent.client:
+        # --- Other Avatars Drawing (Black Dots) ---
+        if self.agent.client and self.agent.running:
+            for coords in self.agent.client.other_avatars:
+                # Coarse coords are (x, y, z)
+                ox, oy, oz = coords
+                x_other = ox * scale
+                y_other = (self.size - oy) * scale
+                
+                # Draw small BLACK dot (radius 3)
+                r = 3
+                self.create_oval(x_other - r, y_other - r, x_other + r, y_other + r,
+                                 fill="#000000", outline="#FFFFFF")
+                                 
+        # --- Agent Drawing (Own Location Indicator) ---
+        if self.agent.client and self.agent.running: # Only draw agent if running
             # Agent Position (AgentUpdate/ImprovedTerseObjectUpdate is 0-256)
             agent_x_sl = self.agent.client.agent_x 
             agent_y_sl = self.agent.client.agent_y 
@@ -2105,51 +2342,20 @@ class MinimapCanvas(tk.Canvas):
             x_on_canvas = agent_x_sl * scale
             y_on_canvas = (self.size - agent_y_sl) * scale 
             
-            if PIL_AVAILABLE:
-                # *** FIX: Draw a rotating arrow for the agent using PIL ***
-                # Create a small blank image for the agent arrow (e.g., 20x20)
-                img_size = 20
-                agent_img = Image.new('RGBA', (img_size, img_size), (0, 0, 0, 0))
-                draw = ImageDraw.Draw(agent_img)
-                
-                # Define the arrow points relative to the small image's center (10, 10)
-                center = img_size / 2
-                arrow_size = 8
-                # Points for an upward pointing arrow (e.g., (10, 2), (18, 18), (2, 18))
-                arrow_points = [(center, 2), (center + arrow_size, center * 2 - 2), (center - arrow_size, center * 2 - 2)]
-                
-                # Draw the unrotated arrow (Green triangle)
-                draw.polygon(arrow_points, fill="#00FF00", outline="#00FF00")
-                
-                # Rotate the image. Rotation angle is relative to UP (North)
-                # LL's yaw (rot_z) is clockwise from positive X (East), so we need to adjust
-                # (Agent's rot_z is in [-2*pi, 2*pi]. 0 is East. We want 0 to be North/Up.)
-                # -90 degrees converts East (0) to North. Then we rotate by the angle.
-                # In PIL: positive angle is counter-clockwise. We want to rotate Clockwise (negative)
-                # Angle in degrees: $ \theta_{\text{deg}} = \frac{\text{rot\_z}}{2\pi} \times 360 - 90 $
-                
-                # Yaw in radians from 0 to 2*pi
-                yaw_normalized = agent_rot_z % (2 * math.pi)
-                # Convert to degrees and adjust for North-Up convention (offset by 90 degrees)
-                # 0 yaw (East) should be rotated 90 degrees CCW to point North (Up)
-                # A positive LL yaw (CCW from East) should result in a CCW screen rotation
-                rotation_degrees = - (yaw_normalized * (180 / math.pi)) + 90 
-                
-                # Perform the rotation
-                rotated_agent_img = agent_img.rotate(rotation_degrees, expand=True)
-                
-                # Convert the PIL image to Tkinter format
-                self.agent_icon_tk = ImageTk.PhotoImage(rotated_agent_img) 
-                
-                # Draw the rotated image
-                self.create_image(x_on_canvas, y_on_canvas, image=self.agent_icon_tk, anchor=tk.CENTER)
-                
-            else:
-                # Draw a simple dot if PIL is missing
-                dot_size = 5
-                self.create_oval(x_on_canvas - dot_size, y_on_canvas - dot_size, 
-                                 x_on_canvas + dot_size, y_on_canvas + dot_size, 
-                                 fill="#00FF00", outline="#00FF00")
+            # Draw Bullseye Indicator (Red outer, Yellow inner)
+            # Replaces the complex Green Arrow
+            r_outer = 5
+            r_inner = 2
+            
+            # Outer Red Circle
+            self.create_oval(x_on_canvas - r_outer, y_on_canvas - r_outer, 
+                             x_on_canvas + r_outer, y_on_canvas + r_outer,
+                             fill="#FF0000", outline="#000000")
+            
+            # Inner Yellow Dot
+            self.create_oval(x_on_canvas - r_inner, y_on_canvas - r_inner,
+                             x_on_canvas + r_inner, y_on_canvas + r_inner,
+                             fill="#FFFF00", outline="#000000")
 
         # Schedule the next redraw
         if self.agent.running:
@@ -2177,6 +2383,18 @@ class ChatTab(ttk.Frame):
         self._set_style(master)
         self._create_widgets()
         self._bind_keys() # Movement key bindings
+        
+        # --- ROBUST MAP TRIGGER ---
+        # Trigger the map fetch shortly after the tab is created.
+        # This avoids the race condition where the handshake packet arrives before the UI exists.
+        def initial_map_load():
+            time.sleep(3.0) # Wait for connection stabilization
+            # Use current region or fallback to "map" (which logic handles)
+            r_name = self.sl_agent.current_region_name or "Home" 
+            self.sl_agent.fetch_map(r_name)
+            
+        threading.Thread(target=initial_map_load, daemon=True).start()
+        # --------------------------
 
     def _set_style(self, master):
         s = ttk.Style(master)
@@ -2241,8 +2459,8 @@ class ChatTab(ttk.Frame):
         teleport_button = ttk.Button(control_frame, text="Teleport...", command=self.do_teleport, style='BlackGlass.TButton')
         teleport_button.pack(side=tk.RIGHT, padx=5)
         
-        logout_button = ttk.Button(control_frame, text="Logout", command=self.on_closing, style='BlackGlass.TButton')
-        logout_button.pack(side=tk.RIGHT, padx=5)
+        self.logout_button = ttk.Button(control_frame, text="Logout", command=self.on_closing, style='BlackGlass.TButton')
+        self.logout_button.pack(side=tk.RIGHT, padx=5)
         
         # --- Main Content Frame (Chat + Right Panel) ---
         main_content_frame = ttk.Frame(self, style='BlackGlass.TFrame')
@@ -2305,8 +2523,8 @@ class ChatTab(ttk.Frame):
         self.message_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
         self.message_entry.bind("<Return>", self.send_message_event)
         
-        send_button = ttk.Button(input_frame, text="Send", command=self.send_message, style='BlackGlass.TButton')
-        send_button.pack(side=tk.RIGHT)
+        self.send_button = ttk.Button(input_frame, text="Send", command=self.send_message, style='BlackGlass.TButton')
+        self.send_button.pack(side=tk.RIGHT)
         
         # --- FIX: Set initial status to a generic placeholder. The login process will update it. ---
         self._update_status(f"Initialized.")
@@ -2364,7 +2582,17 @@ class ChatTab(ttk.Frame):
             self.after(0, self._update_status, f"🟢 Successfully logged in to {region_name.strip()}!")
             self.after(0, self._append_notification, f"[INFO] Logged in to {region_name.strip()}.")
             
-        # --- END FIX ---
+            # --- FIX: Trigger Map Fetch with Delay ---
+            # Wait 2 seconds to ensure coordinates are stable and UI is ready
+            self.after(2000, lambda: self.sl_agent.fetch_map(region_name.strip()))
+            
+        # --- KICKED LOG HANDLER (NEW) ---
+        elif message.startswith("KICKED"):
+            _, reason = message.split(", ", 1)
+            # Pass the kick reason to the status update
+            self.after(0, self._update_status, f"🔴 Kicked: {reason.strip()}")
+            self.after(0, self._set_disconnected_ui)
+        # --- END KICKED LOG HANDLER ---
             
         elif message == "MINIMAP_UPDATE":
              # Use self.after to redraw safely from the main thread
@@ -2381,10 +2609,13 @@ class ChatTab(ttk.Frame):
         elif update_type == "status":
             # This is primarily used for connection/teleport status updates
             self.after(0, self._update_status, message)
+        elif update_type == "notification": # NEW: Generic notification handler
+             self.after(0, self._append_notification, message)
         elif update_type == "error":
             # Use custom ThemedMessageBox for critical errors
             self.after(0, lambda: ThemedMessageBox(self.master, f"{self.my_first_name} Error", message, 'error'))
             self.after(0, self._update_status, f"Error: {message}")
+            self.after(0, self._set_disconnected_ui) # Disable chat/send on error
         elif update_type == "teleport_offer":
             # Use the notification area for a non-critical alert, but keep the standard dialog for user action
             self.after(0, self._append_notification, f"[ALERT] Teleport offer received to {message['region']}.")
@@ -2392,6 +2623,9 @@ class ChatTab(ttk.Frame):
         elif update_type == "map_fetch_request":
             # Handle map fetch request triggered by RegionClient
             self.after(0, lambda: self._start_map_fetch_task(message))
+        elif update_type == "delayed_map_fetch":
+            # NEWROBUSTMETHOD: Wait 2.5s then fetch map
+            self.after(2500, lambda: self.sl_agent.fetch_map(message))
         elif update_type == "map_image_fetched":
             # Handle image data received from the fetch thread
             self.after(0, lambda: self._handle_map_image_data(message))
@@ -2402,7 +2636,7 @@ class ChatTab(ttk.Frame):
         self.chat_display.insert(tk.END, message + "\n")
         self.chat_display.config(state='disabled')
         self.chat_display.see(tk.END) 
-        
+                
     def _append_notification(self, message):
         self.notification_area.config(state='normal')
         self.notification_area.insert(tk.END, message + "\n", 'alert')
@@ -2411,18 +2645,43 @@ class ChatTab(ttk.Frame):
         
     def _update_status(self, message):
         self.status_bar.config(text=message, foreground='#FFFFFF') 
-        # --- FIX: Only check for "Successfully logged in" for color, the message is set via the log callback
+        
         if message.startswith("🟢 Successfully logged in"): 
             self.status_bar.config(foreground='#00FF00') 
-        # --- END FIX ---
         elif "Teleport finished" in message or "Waiting for confirmation" in message:
              self.status_bar.config(foreground='#00FFFF') 
-        elif "Error" in message or "Disconnected" in message or "Teleport failed" in message:
+        elif "Error" in message or "Teleport failed" in message:
              self.status_bar.config(foreground='#FF0000') 
-             # Use a thread-safe call to close the tab
-             if "Disconnected" in message:
-                self.after(1000, lambda: self.tab_manager.remove_tab(self.my_first_name, self)) 
+        # MODIFIED: Removed auto-close logic, now using a dedicated function for visual feedback
+        elif "Disconnected" in message or message.startswith("🔴 Kicked"):
+             self._set_disconnected_ui()
 
+    # --- NEW METHOD (Start) ---
+    def _set_disconnected_ui(self):
+        """Sets the UI to a disconnected state."""
+        self.status_bar.config(foreground='#FF0000') 
+        self.message_entry.config(state='disabled')
+        self.send_button.config(state='disabled')
+        # Change the Logout button to a Close Tab button
+        self.logout_button.config(text="Close Tab", command=lambda: self.tab_manager.remove_tab(self.my_first_name, self)) 
+    # --- NEW METHOD (End) ---
+
+    # --- NEW METHOD: Missing log callback ---
+    def handle_debug_log_callback(self, message):
+        """Handles debug messages from the agent."""
+        if message == "MINIMAP_UPDATE":
+            self.minimap.after(0, self.minimap.update_map)
+            return
+            
+        if message.startswith("[CHAT]"):
+            clean = message.replace("[CHAT]", "").strip()
+            self.after(0, self._append_chat, clean)
+            return
+            
+        if message.startswith("DEBUG: "):
+            # Optional: direct to notification
+            pass
+            
     def _show_teleport_offer(self, offer_data):
         region_name = offer_data['region']
         cost = offer_data['cost']
@@ -2465,8 +2724,14 @@ class ChatTab(ttk.Frame):
             self.sl_agent.teleport(region_name.strip())
 
     def on_closing(self):
-        # MODIFIED: Use ThemedMessageBox instead of messagebox.askyesno
-        dialog_result = ThemedMessageBox(self.master, "Logout", f"Are you sure you want to log out {self.my_first_name} and close this tab?", 'yesno').result
+        """Handles the user-initiated logout."""
+        # Only prompt if the agent is still running
+        if self.sl_agent.running:
+            # MODIFIED: Use ThemedMessageBox instead of messagebox.askyesno
+            dialog_result = ThemedMessageBox(self.master, "Logout", f"Are you sure you want to log out {self.my_first_name} and close this tab?", 'yesno').result
+        else:
+            # If the agent is not running (e.g., disconnected/kicked), just ask to close the tab.
+            dialog_result = True 
         
         if dialog_result:
             # Tell the minimap loop to stop
