@@ -46,8 +46,8 @@ class fixed:
         if type(data) == bytes:
             self.data = data
         elif type(data) == str:
-            # Improvement: Use latin-1 for protocol strings
-            self.data = data.encode("latin-1")
+            # Improvement: Use utf-8 for protocol strings
+            self.data = data.encode("utf-8")
         elif hasattr(data, "__bytes__"):
             self.data = bytes(data)
         else:
@@ -58,25 +58,25 @@ class fixed:
         return len(self.data)
     def __str__(self):
         try:
-            return self.data.decode("latin-1") # Decoded with latin-1
+            return self.data.decode("utf-8") # Decoded with utf-8
         except:
             return "<FIXED: %i>"%len(self.data)
 
 class variable:
     data = b""
     type = 0
-    def __init__(self, ty = 1, data = b""):
+    def __init__(self, ty = 1, data = b"", add_null = False):
         
-        # --- FIX: Ensure Correct Latin-1 Encoding and Null Termination ---
+        # --- FIX: Ensure Correct UTF-8 Encoding and Null Termination ---
         if type(data) == bytes:
             self.data = data
         elif type(data) == str:
-            # FIX: Only encode and null-terminate if the string does *not* already end with \x00.
-            # Use latin-1 for protocol strings
-            if not data.endswith('\x00'):
-                self.data = (data + '\x00').encode("latin-1")
+            # FIX: Only encode and null-terminate if requested and if not already present.
+            # Use utf-8 for protocol strings
+            if add_null and not data.endswith('\x00'):
+                self.data = (data + '\x00').encode("utf-8")
             else:
-                self.data = data.encode("latin-1")
+                self.data = data.encode("utf-8")
                 
         elif hasattr(data, "__bytes__"):
             self.data = bytes(data)
@@ -106,8 +106,8 @@ class variable:
         return len(self.data)
     def __str__(self):
         try:
-            # Decoded with latin-1, strip the null terminator
-            return self.data.decode("latin-1").rstrip('\x00') 
+            # Decoded with utf-8, strip the null terminator
+            return self.data.decode("utf-8").rstrip('\x00') 
         except:
             return "<VARIABLE %i: %i>"%(self.type,len(self.data))
     def __repr__(self):
@@ -118,7 +118,7 @@ class vector3:
     def __init__(self, x=0, y=0, z=0):
         self.x = x; self.y = y; self.z = z
     def __bytes__(self):
-        return struct.pack("<fff", self.x, self.y, self.y)
+        return struct.pack("<fff", self.x, self.y, self.z)
     def __str__(self):
         return "<%f, %f, %f>"%(self.x, self.y, self.z)
     def __eq__(self, cmp):
@@ -142,13 +142,13 @@ class vector4:
         return "<%f, %f, %f, %f>"%(self.x, self.y, self.z, self.s)
 
 class quaternion:
-    x = 0; y = 0; z = 0; s = 0
-    def __init__(self, s=0, x=0, y=0, z=0):
-        self.s = s; self.x = x; self.y = y; self.z = z
+    x = 0; y = 0; z = 0; w = 1
+    def __init__(self, x=0, y=0, z=0, w=1):
+        self.x = x; self.y = y; self.z = z; self.w = w
     def __bytes__(self):
-        return struct.pack("<ffff", self.s, self.x, self.y, self.z) # Corrected to 4 floats for quaternion
+        return struct.pack("<ffff", self.x, self.y, self.z, self.w)
     def __str__(self):
-        return "<%f, %f, %f, %f>"%(self.s, self.x, self.y, self.z)
+        return "<%f, %f, %f, %f>"%(self.x, self.y, self.z, self.w)
 
 rotation = quaternion
 
@@ -291,7 +291,7 @@ def zerocode_decode(bytedata):
         i += 1
         
         # Check for count byte. If next byte is non-zero, it is the count (C extra nulls).
-        if i < l and bytedata[i] != 0:
+        if i < l:
             count = bytedata[i] 
             # Insert the C extra nulls
             output.extend(b"\x00" * count)
@@ -326,10 +326,10 @@ def zerocode_encode(bytedata):
             c += 1
             i += 1
         
-        # If c > 0 (meaning 2 or more consecutive nulls total), insert count byte for the extra nulls
-        if c > 0:
-            output.append(c) 
-        # If c == 0, it was just the single null terminator, which is preserved by the marker.
+        # If c >= 0 (meaning 1 or more consecutive nulls total), insert count byte for the extra nulls
+        # Note: Even for a single null (c=0), we append the count byte (0) to maintain 
+        # consistency with the decoder which ALWAYS expects a count byte after a null marker.
+        output.append(c) 
         
     return bytes(output)
 
@@ -593,11 +593,10 @@ class ChatFromSimulator(BaseMessage):
 registerMessage(ChatFromSimulator)
 
 class ChatFromViewer(BaseMessage):
-    name = "ChatFromViewer"; id = 80; freq = 2; trusted = False; zero_coded = True
+    name = "ChatFromViewer"; id = 80; freq = 2; trusted = False; zero_coded = False
     blocks = [("AgentData", 1), ("ChatData", 1)]
     structure = {
         "AgentData": [("AgentID", "LLUUID"), ("SessionID", "LLUUID")],
-        # Message field uses Variable, type 2 for chat from viewer
         "ChatData": [("Message", "Variable", 2), ("Type", "U8"), ("Channel", "S32")]
     }
 registerMessage(ChatFromViewer)
@@ -724,6 +723,30 @@ registerMessage(MapItemReply)
 
 # --- Object/Self Position Update Messages (For Minimap) ---
 
+class CoarseLocationUpdate(BaseMessage):
+    name = "CoarseLocationUpdate"; id = 234; freq = 2; trusted = True; zero_coded = True
+    blocks = [("Location", 0), ("Index", 1), ("AgentData", 0)]
+    structure = {
+        "Location": [("X", "U8"), ("Y", "U8"), ("Z", "U8")],
+        "Index": [("You", "S16"), ("PreYou", "S16")],
+        "AgentData": [("AgentID", "LLUUID")]
+    }
+registerMessage(CoarseLocationUpdate)
+
+class ObjectUpdate(BaseMessage):
+    name = "ObjectUpdate"; id = 4294967295; freq = 3; trusted = True; zero_coded = True
+    blocks = [("RegionData", 1), ("ObjectData", 0)]
+    structure = {
+        "RegionData": [("RegionHandle", "U64"), ("TimeDilation", "U16")],
+        "ObjectData": [
+            ("ID", "U32"), ("State", "U8"), ("FullID", "LLUUID"), ("CRC", "U32"),
+            ("PCode", "U8"), ("Material", "U8"), ("ClickAction", "U8"), ("Scale", "LLVector3"),
+            ("ObjectData", "Variable", 1), ("ParentID", "U32"), ("UpdateFlags", "U32"),
+            ("Data", "Variable", 1)
+        ]
+    }
+registerMessage(ObjectUpdate)
+
 class ImprovedTerseObjectUpdate(BaseMessage):
     name = "ImprovedTerseObjectUpdate"; id = 4294967292; freq = 3; trusted = False; zero_coded = True
     blocks = [("RegionData", 1), ("ObjectData", 0)]
@@ -757,11 +780,12 @@ registerMessage(KickUser)
 
 class Packet:
     bytes = b""; body = None; MID = 0; sequence = 0; extra = b""
-    acks = []; flags = 0; zero_coded = 0; reliable = 0; resent = 0; ack = True
+    flags = 0; zero_coded = 0; reliable = 0; resent = 0; ack = True
     
     def __init__(self, data=None, message=None, mid=0, sequence=0, zero_coded=0, reliable=0, resent=0, ack=0, acks=[]):
+        self.acks = [] # FIX: Ensure ACKs don't accumulate in class attribute
         if data:
-            self.flags, self.sequence, self.extra_bytes = struct.unpack_from(">BiB", data[:6])
+            self.flags, self.sequence, self.extra_bytes = struct.unpack_from(">BIB", data[:6])
             self.zero_coded = (self.flags&0x80 == 0x80)
             self.reliable = (self.flags&0x40 == 0x40)
             self.resent = (self.flags&0x20 == 0x20)
@@ -769,34 +793,50 @@ class Packet:
             self.extra = data[6:6+self.extra_bytes]
             
             payload = data[6+self.extra_bytes:]
-            if self.zero_coded: self.bytes = zerocode_decode(payload)
-            else: self.bytes = payload
-                
-            offset = 1 # Start past the MID in body
-
-            # Determine MID, Frequency, and Real ID
-            try:
-                mid_raw = struct.unpack_from(">I", self.bytes, 0)[0]
-            except struct.error:
-                # Malformed packet body
-                return
-
-            realID = mid_raw
-            offset = 4
-            if mid_raw & 0xFFFFFFFA == 0xFFFFFFFA: # Fixed-frequency packet (3) - CloseCircuit, PacketAck etc.
-                self.MID = mid_raw
-            elif mid_raw & 0xFFFF0000 == 0xFFFF0000: # High-frequency packet (2) - Most normal packets
-                self.MID = mid_raw & 0x0000FFFF
-                realID = self.MID + 0xFFFF0000
-            elif mid_raw & 0xFF000000 == 0xFF000000: # Medium-frequency packet (1) - Not common
-                self.MID = (mid_raw >> 16) & 0xFF
-                realID = self.MID + 0xFF00
-                offset = 2
-            else: # Low-frequency packet (0) - PingCheck, AgentUpdate
-                self.MID = (mid_raw >> 24) & 0xFF
-                realID = self.MID
-                offset = 1
             
+            # --- FIX: Extract MID BEFORE zero-coding decoding ---
+            # This is critical because the MID is NOT zero-coded, but the rest of the body is.
+            # If the MID contains \x00, zero-decoding it would corrupt the packet structure.
+            
+            mid_raw = 0
+            mid_offset = 0
+            if payload[0] == 0xFF:
+                if payload[1] == 0xFF: # High/Fixed frequency (4 bytes)
+                    mid_raw = struct.unpack(">I", payload[:4])[0]
+                    mid_offset = 4
+                else: # Medium frequency (2 bytes)
+                    mid_raw = struct.unpack(">H", payload[:2])[0]
+                    mid_offset = 2
+            else: # Low frequency (1 byte)
+                mid_raw = payload[0]
+                mid_offset = 1
+
+            # Save the raw MID bytes for later use in decoding the body
+            self.MID = mid_raw
+            body_payload = payload[mid_offset:]
+
+            if self.zero_coded: self.bytes = zerocode_decode(body_payload)
+            else: self.bytes = body_payload
+            
+            realID = mid_raw
+            offset = 0 # body_payload already starts after the MID
+            
+            # Re-determine frequency-adjusted ID for message lookup
+            if mid_raw & 0xFFFFFFFA == 0xFFFFFFFA: # Fixed-frequency packet (3)
+                pass 
+            elif mid_raw & 0xFFFF0000 == 0xFFFF0000: # High-frequency packet (2)
+                realID = (mid_raw & 0x0000FFFF) + 0xFFFF0000
+            elif mid_raw & 0xFFFFFF00 == 0xFFFF0000: # Wait, mid_raw for freq 1 is 2 bytes?
+                # Actually frequency logic is easier if we use the bits:
+                pass
+            
+            # Simplified Frequency/ID logic matching SL protocol:
+            if mid_raw < 0xFF: # Low frequency
+                realID = mid_raw
+            elif mid_raw < 0xFFFF: # Medium
+                realID = mid_raw # mid_raw already has the 0xFF prefix if 2 bytes
+            else: # High or Fixed
+                realID = mid_raw # mid_raw already has the 0xFFFF prefix if 4 bytes
             # Use the determined offset to get the body data
             self.body = getMessageByID(realID, self.bytes[offset:])
             if not self.body: 
@@ -862,7 +902,7 @@ class Packet:
         elif self.body.freq == 0: result = struct.pack(">B", self.MID)
         
         # 5. Full Packet Assembly
-        return struct.pack(">BiB", self.flags, self.sequence, len(self.extra)) + self.extra + result + body + acks_bytes
+        return struct.pack(">BIB", self.flags, self.sequence, len(self.extra)) + self.extra + result + body + acks_bytes
 
 # ==========================================
 # SECTION 6: NETWORK LAYER (UDPStream.py as RegionClient)
@@ -1055,8 +1095,18 @@ class RegionClient:
             if seq_id in self.reliable_packets:
                 del self.reliable_packets[seq_id]
                 self.log(f"ACK received for reliable packet {seq_id}.")
+                self.log(f"ACK_CONFIRMED: {seq_id}") # Trigger UI notification
 
-        if pck.body.name == "MapItemReply":
+        if pck.body.name == "PacketAck":
+            # Process dedicated PacketAck messages
+            for block in pck.body.Packets:
+                seq_id = block["ID"]
+                if seq_id in self.reliable_packets:
+                    del self.reliable_packets[seq_id]
+                    self.log(f"Dedicated ACK received for reliable packet {seq_id}.")
+                    self.log(f"ACK_CONFIRMED: {seq_id}") # Trigger UI notification
+
+        elif pck.body.name == "MapItemReply":
             # NEW: Handle MapItemReply for active lookup
             if self.teleport_lookup_target_name is not None:
                 with self.teleport_lookup_lock:
@@ -1076,9 +1126,8 @@ class RegionClient:
         elif pck.body.name == "ObjectUpdate":
             # Capture LocalID from ObjectUpdate to enable Terse updates
             for block in pck.body.ObjectData:
-                # Check if this object is ME
-                # Note: FullID might be under 'FullID' or similar depending on the block type
-                full_id = getattr(block, 'FullID', None)
+                # FIX: Blocks are dictionaries, use .get()
+                full_id = block.get('FullID')
                 if full_id == self.agent_id:
                     self.local_id = block["ID"]
                     self.log_callback(f"[CHAT] Agent LocalID Captured: {self.local_id}")
@@ -1101,41 +1150,54 @@ class RegionClient:
                             # Standard Avatar Interpretation (Offset 1, 12 bytes float)
                             if len(data) >= 13:
                                 px, py, pz = struct.unpack("<fff", data[1:13])
+                                
+                                # Process rotation if 12 bytes available after position (offset 13 + 12 = 25)
+                                if len(data) >= 25:
+                                    # Rotation is typically packed; for now, let's just log it if we can
+                                    # Radian yaw is often at a specific offset in terse updates
+                                    pass
+
                                 # Normalizing: if values are > 256, they are likely global.
                                 # Region local is always 0.0-256.0.
                                 if px > 256: px %= 256
                                 if py > 256: py %= 256
                                 
-                                self.agent_x, self.agent_y = px, py
-                                self.log_callback(f"[CHAT] Own Pos: {px:.1f}, {py:.1f}")
+                                self.agent_x, self.agent_y, self.agent_z = px, py, pz
+                                self.log_callback(f"[CHAT] Own Pos: {px:.1f}, {py:.1f}, {pz:.1f}")
                                 self.log_callback("MINIMAP_UPDATE")
-                                break
-                            
-                            # Compressed Interpretation (Offset 0, 4 bytes U16)
-                            px_raw, py_raw = struct.unpack("<HH", data[0:4])
-                            px, py = px_raw / 256.0, py_raw / 256.0
-                            self.agent_x, self.agent_y = px, py
-                            self.log_callback(f"[CHAT] Own Pos (comp): {px:.1f}, {py:.1f}")
-                            self.log_callback("MINIMAP_UPDATE")
-                        except:
-                            pass
+                            else:
+                                # Compressed Interpretation (Offset 0, 4 bytes U16)
+                                px_raw, py_raw = struct.unpack("<HH", data[0:4])
+                                px, py = px_raw / 256.0, py_raw / 256.0
+                                self.agent_x, self.agent_y = px, py
+                                self.log_callback(f"[CHAT] Own Pos (comp): {px:.1f}, {py:.1f}")
+                                self.log_callback("MINIMAP_UPDATE")
+                        except Exception as e:
+                            self.log_callback(f"[CHAT] Failed to parse position: {e}")
                     break
         
         elif pck.body.name == "CoarseLocationUpdate":
             # Handle other avatars for minimap
             new_avatars = []
             
-            # The sim typically sends 'Location' block.
-            location_blocks = getattr(pck.body, 'Location', [])
-            if not location_blocks:
-                location_blocks = getattr(pck.body, 'AgentData', [])
+            # The simulator sends a 'Location' block and an optional 'Index' block
+            # Index["You"] tells us where we are in the list.
+            locations = getattr(pck.body, 'Location', [])
+            you_index = -1
+            if hasattr(pck.body, 'Index') and len(pck.body.Index) > 0:
+                you_index = pck.body.Index[0].get('You', -1)
             
-            for block in location_blocks:
-                if 'X' in block and 'Y' in block:
-                    new_avatars.append((block['X'], block['Y'], 0))
+            for i, loc in enumerate(locations):
+                if i == you_index:
+                    continue # Skip self, we use terse updates for high precision
+                
+                # Coarse coords are U8 (0-255)
+                new_avatars.append((loc['X'], loc['Y'], loc['Z']))
                 
             self.other_avatars = new_avatars
-            self.log_callback(f"[CHAT] Received {len(self.other_avatars)} avatar dots.")
+            # Only log if there are actually avatars to avoid spam
+            if len(self.other_avatars) > 0:
+                self.log_callback(f"[CHAT] Received {len(self.other_avatars)} avatar dots.")
             self.log_callback("MINIMAP_UPDATE")
 
         elif pck.body.name == "StartPingCheck":
@@ -1147,9 +1209,7 @@ class RegionClient:
             self.handshake_complete = True # Signal that Handshake is done!
             self.sim['name'] = str(pck.body.RegionInfo["SimName"])
             
-            # Send the ACK for the UseCircuitCode packet. This is implied by the successful handshake.
-            # The UseCircuitCode packet's sequence number is self.circuit_sequence.
-            self.acks.append(self.circuit_sequence) 
+            # self.acks.append(self.circuit_sequence) # REMOVED: Correct ACK logic is via received ACKs or PacketAck
             self.circuit_packet = None # No longer need to resend the circuit code
             self.cam_packet = None # ADDED: Clear CAM state
 
@@ -1236,7 +1296,7 @@ class RegionClient:
         try:
             # If blob is a Packet (like self.circuit_packet or self.cam_packet), it is sent as-is.
             self.sock.sendto(bytes(blob), (self.host, self.port))
-            return True
+            return blob.sequence
         except Exception as e: 
             if self.debug: self.log_callback(f"ERROR: Send error: {e}")
             return False
@@ -1293,14 +1353,14 @@ class RegionClient:
         msg.AgentData["AgentID"] = self.agent_id
         msg.AgentData["SessionID"] = self.session_id
         
-        # NOTE: A proper implementation would update this rotation based on user input
-        # For a basic chat bot, this identity quaternion is sufficient.
-        body_rotation = quaternion(1.0, 0.0, 0.0, 0.0) 
+        # NOTE: Using corrected identity quaternion (0,0,0,1)
+        body_rotation = quaternion(0.0, 0.0, 0.0, 1.0) 
         
         msg.AgentData["BodyRotation"] = body_rotation
         msg.AgentData["HeadRotation"] = body_rotation
         msg.AgentData["State"] = 0
-        msg.AgentData["CameraCenter"] = vector3(128,128,0)
+        # Use the agent's actual position for the camera center
+        msg.AgentData["CameraCenter"] = vector3(self.agent_x, self.agent_y, self.agent_z)
         msg.AgentData["CameraAtAxis"] = vector3(0,1,0)
         msg.AgentData["CameraLeftAxis"] = vector3(1,0,0)
         msg.AgentData["CameraUpAxis"] = vector3(0,0,1)
@@ -1329,7 +1389,7 @@ def safe_decode_llvariable(ll_var):
     if hasattr(ll_var, 'data') and isinstance(ll_var.data, bytes):
         try:
             # FIX: Use the 'data' attribute directly for the raw bytes, and strip the null terminator
-            return ll_var.data.decode('latin-1').rstrip('\x00')
+            return ll_var.data.decode('utf-8').rstrip('\x00')
         except:
             return str(ll_var.data)
     # If the object is passed as a string/simple type, return it as a string
@@ -1407,6 +1467,11 @@ class SecondLifeAgent:
                 self.ui_callback("status", f"🔴 Kicked: {reason.strip()}")
                 self.running = False # Stop the event loop upon kick
                 
+            # --- CHAT ACK HANDLER ---
+            elif message.startswith("ACK_CONFIRMED:"):
+                _, seq_id = message.split(": ", 1)
+                self.ui_callback("chat_ack", int(seq_id.strip()))
+                
             else:
                 self.debug_callback(message)
 
@@ -1474,9 +1539,17 @@ class SecondLifeAgent:
             
             current_time = time.time()
             
-            # --- Network Maintenance (Handshake) ---
+            # --- Periodic Network Maintenance ---
+            # Send periodic AgentUpdates both DURING and AFTER handshake to stay active.
+            if current_time - self.client.last_update_send > 0.5:
+                # Pass the client's internal controls state
+                self.client.agentUpdate(controls=self.client.controls_once|self.client.controls, reliable=False) 
+                self.client.controls_once = 0
+                if not self.client.handshake_complete:
+                    self.log("Sending Handshake AgentUpdate...")
+                    self.ui_callback("progress", ("AgentUpdate", 75))
+
             if not self.client.handshake_complete:
-                
                 # Resend handshake packets if needed
                 if current_time - self.client.last_circuit_send > 1.0: 
                     self.log("Resending UseCircuitCode...")
@@ -1487,14 +1560,6 @@ class SecondLifeAgent:
                     self.log("Resending CompleteAgentMovement...")
                     self.ui_callback("progress", ("CompleteAgentMovement", 50))
                     self.client.send_complete_movement()
-                
-                is_reliable = False
-                if current_time - self.client.last_update_send > 0.5:
-                    self.log(f"Sending AgentUpdate (Reliable: {is_reliable})...")
-                    self.ui_callback("progress", ("AgentUpdate", 75))
-                    # Pass the client's internal controls state
-                    self.client.agentUpdate(controls=self.client.controls_once|self.client.controls, reliable=is_reliable) 
-                    self.client.controls_once = 0
             
             # --- Resend Reliable Packets ---
             if self.client.handshake_complete:
@@ -1558,6 +1623,8 @@ class SecondLifeAgent:
                         msg_text = safe_decode_llvariable(chat_data.get('Message', ''))
                         # ChatType is U8
                         chat_type = chat_data.get('ChatType', 0) 
+                        # SourceID is the UUID of the sender
+                        source_id = chat_data.get('SourceID', None)
 
                         # 1. Filter empty messages
                         if not msg_text:
@@ -1568,8 +1635,13 @@ class SecondLifeAgent:
                         if chat_type in (const.CHAT_START_TYPING, const.CHAT_STOP_TYPING):
                             self.log(f"Filtered typing indicator (Type: {chat_type}) from {from_name}.")
                             continue
+                        
+                        # 3. Filter own messages (already displayed when ACK'd)
+                        if source_id and source_id == self.client.agent_id:
+                            self.log(f"Filtered own message echo from simulator.")
+                            continue
                             
-                        # Only display valid messages
+                        # Only display valid messages from other avatars
                         self.ui_callback("chat", f"[{from_name}]: {msg_text}")
                 
                 # --- Handle Teleport Offer ---
@@ -1716,18 +1788,18 @@ class SecondLifeAgent:
         self.log(f"Sending Chat: '{message[:15]}...' (Type: {chat_type}, Channel: {channel})")
         
         msg = getMessageByName("ChatFromViewer")
-        msg.AgentData["AgentID"] = self.agent_id
-        msg.AgentData["SessionID"] = self.session_id
+        # FIX: Use client's agent_id and session_id to ensure consistency with the active UDP connection
+        msg.AgentData["AgentID"] = self.client.agent_id
+        msg.AgentData["SessionID"] = self.client.session_id
         
-        # --- CHAT FIX: Variable Type 2 is correct, relying on variable.__init__ for latin-1 and null-termination ---
-        # The string must be encoded with latin-1 and null-terminated. The variable class handles this correctly.
-        msg.ChatData["Message"] = variable(2, message) 
+        # --- CHAT FIX: Variable Type 2, UTF-8, WITH AUTOMATIC NULL TERMINATION ---
+        # Passing the string with add_null=True to match standard SL chat packet expectations.
+        msg.ChatData["Message"] = variable(2, message, add_null=True) 
         
         msg.ChatData["Type"] = chat_type
         msg.ChatData["Channel"] = channel
         
-        # Use the standard client send method, forcing reliability.
-        # The client.send method will handle sequence, ACKs, and tracking now.
+        # Use reliable=True for chat so we can track receipt via ACK
         return self.client.send(msg, reliable=True)
     
     def send_chat(self, message):
@@ -1877,7 +1949,8 @@ class SecondLifeAgent:
                  
             # FIX: Ensure the Variable field is set with the correctly encoded bytes and type 1
             # Pass the raw string, the variable class handles encoding.
-            msg_request.RequestData["Name"] = variable(1, region_name) 
+            # Standard region names in map lookup are null-terminated.
+            msg_request.RequestData["Name"] = variable(1, region_name, add_null=True) 
             msg_request.RequestData["Flags"] = 0 
             
             # Send the request
@@ -2250,12 +2323,20 @@ class MinimapCanvas(tk.Canvas):
         self.agent = agent
         self.configure(bg='#1C1C1C', highlightthickness=1, highlightbackground='#444444')
         self.size = 256 # SL regions are 256x256 meters
+        self.source_image = None # NEW: Store original PIL image
         self.map_image = None # Tkinter PhotoImage object for the map tile
+        self.last_size = (0, 0) # NEW: Track size to avoid redundant resizing
         # NEW: Placeholder image if PIL is not available
         self.placeholder_image = self._create_placeholder_image() if PIL_AVAILABLE else None
         self.bind("<Configure>", self.on_resize)
         self.last_update_time = 0
         self.after(100, self.draw_map) # Start the drawing loop
+
+    def set_map_image(self, pil_image):
+        """Sets the source PIL image for the map."""
+        self.source_image = pil_image
+        self.last_size = (0, 0) # Force re-render
+        self.draw_map()
 
     def _create_placeholder_image(self):
         """Creates a default green circle image for the agent, using PIL."""
@@ -2280,8 +2361,11 @@ class MinimapCanvas(tk.Canvas):
         self.draw_map()
 
     def update_map_image(self, img_tk):
-        """Sets the Tkinter PhotoImage to be displayed."""
-        self.map_image = img_tk
+        """Sets the Tkinter PhotoImage to be displayed. Deprecated for set_map_image."""
+        if img_tk is None:
+            self.source_image = None
+            self.map_image = None
+            self.last_size = (0, 0)
         self.draw_map()
 
     def draw_map(self):
@@ -2292,39 +2376,66 @@ class MinimapCanvas(tk.Canvas):
         width = self.winfo_width()
         height = self.winfo_height()
         
-        scale = min(width, height) / self.size
-        
-        center_x = width / 2
-        center_y = height / 2
+        if width <= 1 or height <= 1:
+             # Widget not fully initialized
+             if self.agent.running:
+                 self.after(100, self.draw_map)
+             return
+
+        dest_size = min(width, height)
+        # Calculate offsets to center the map content
+        offset_x = (width - dest_size) / 2
+        offset_y = (height - dest_size) / 2
+
+        # --- Handle Image Resizing ---
+        if PIL_AVAILABLE and self.source_image:
+             if (width, height) != self.last_size:
+                 # Resize needed
+                 try:
+                     # High quality resize
+                     resample = Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS
+                     resized = self.source_image.resize((int(dest_size), int(dest_size)), resample)
+                     self.map_image = ImageTk.PhotoImage(resized)
+                     self.last_size = (width, height)
+                 except Exception:
+                     pass
 
         # --- Map Image/Placeholder Drawing ---
         if self.map_image and PIL_AVAILABLE: # Only use image if PIL is available
-            # Display the actual image
-            self.create_image(center_x, center_y, image=self.map_image, anchor=tk.CENTER)
+            # Display the actual image centered
+            self.create_image(width/2, height/2, image=self.map_image, anchor=tk.CENTER)
             # Draw the region boundary over the image
-            self.create_rectangle(0, 0, width, height, outline='#444444')
+            self.create_rectangle(offset_x, offset_y, offset_x+dest_size, offset_y+dest_size, outline='#444444')
         else:
             # General placeholder when map is not loaded or failed
-            self.create_rectangle(0, 0, width, height, fill='#303030', outline='#444444')
+            self.create_rectangle(offset_x, offset_y, offset_x+dest_size, offset_y+dest_size, fill='#303030', outline='#444444')
             
             # --- FIX: Show debug info on the canvas ---
             gx = getattr(self.agent.client, 'grid_x', '?')
             gy = getattr(self.agent.client, 'grid_y', '?')
             debug_text = f"Map Unavailable\nGrid: {gx}, {gy}"
             
+            center_x = width / 2
+            center_y = height / 2
             if not PIL_AVAILABLE:
                 self.create_text(center_x, center_y, text="Pillow Missing!", fill='#FF0000')
             else:
                 self.create_text(center_x, center_y, text=debug_text, fill='#888888', justify=tk.CENTER)
         # --- End Map Image/Placeholder Drawing ---
         
+        # --- Scale Factor ---
+        # 1.0 means 256 meters = dest_size pixels
+        scale = dest_size / self.size
+
         # --- Other Avatars Drawing (Black Dots) ---
         if self.agent.client and self.agent.running:
             for coords in self.agent.client.other_avatars:
                 # Coarse coords are (x, y, z)
                 ox, oy, oz = coords
-                x_other = ox * scale
-                y_other = (self.size - oy) * scale
+                
+                # Apply scaling and offsets
+                x_other = ox * scale + offset_x
+                y_other = (self.size - oy) * scale + offset_y
                 
                 # Draw small BLACK dot (radius 3)
                 r = 3
@@ -2339,8 +2450,9 @@ class MinimapCanvas(tk.Canvas):
             agent_rot_z = self.agent.client.agent_rot_z # Yaw in radians
     
             # Map to Canvas: X is proportional, Y is inverted (256-Y)
-            x_on_canvas = agent_x_sl * scale
-            y_on_canvas = (self.size - agent_y_sl) * scale 
+            # Apply scaling and offsets
+            x_on_canvas = agent_x_sl * scale + offset_x
+            y_on_canvas = (self.size - agent_y_sl) * scale + offset_y
             
             # Draw Bullseye Indicator (Red outer, Yellow inner)
             # Replaces the complex Green Arrow
@@ -2373,6 +2485,8 @@ class ChatTab(ttk.Frame):
         self.my_first_name = first
         self.my_last_name = last
         self.tab_manager = tab_manager 
+        
+        self.pending_chat = {} # FIX: Store messages awaiting ACK echo
         
         # Update the agent's callback to target this specific tab
         self.sl_agent.ui_callback = self.update_ui 
@@ -2553,15 +2667,10 @@ class ChatTab(ttk.Frame):
             # Open the image from bytes stream using PIL
             image = Image.open(BytesIO(map_data))
             
-            # Resize the image to 256x256 using the high-quality LANCZOS resampling filter
-            if image.size != (256, 256):
-                 # Use Image.Resampling.LANCZOS for high quality resampling
-                 resample_filter = Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS
-                 image = image.resize((256, 256), resample_filter)
-                 
-            # Convert to Tkinter PhotoImage. The reference must be stored in self.map_image.
-            self.map_image = ImageTk.PhotoImage(image)
-            self.minimap.update_map_image(self.map_image)
+            # We no longer resize here; we pass the source image to the minimap canvas
+            # which handles resizing effectively.
+            
+            self.minimap.set_map_image(image)
             self._append_notification("[SUCCESS] Map tile loaded and displayed.")
             
         except ImportError:
@@ -2606,6 +2715,12 @@ class ChatTab(ttk.Frame):
         """Thread-safe update of the GUI."""
         if update_type == "chat":
             self.after(0, self._append_chat, message)
+        elif update_type == "chat_ack":
+            # message is the sequence number
+            seq_id = message
+            if seq_id in self.pending_chat:
+                confirmed_msg = self.pending_chat.pop(seq_id)
+                self.after(0, self._append_chat, f"[{self.my_first_name} {self.my_last_name}]: {confirmed_msg}")
         elif update_type == "status":
             # This is primarily used for connection/teleport status updates
             self.after(0, self._update_status, message)
@@ -2712,8 +2827,13 @@ class ChatTab(ttk.Frame):
         if not message:
             return
         
-        self._append_chat(f"[{self.my_first_name} {self.my_last_name}]: {message}") 
-        self.sl_agent.send_chat(message)
+        # sequence is returned from send_chat
+        seq_id = self.sl_agent.send_chat(message)
+        
+        if seq_id:
+            # Store it so we can echo it only when ACKed
+            self.pending_chat[seq_id] = message
+            
         self.message_entry.delete(0, tk.END)
 
     def do_teleport(self):
@@ -2903,7 +3023,11 @@ class LoginPanel(ttk.Frame):
             self.region_entry.insert(0, creds['region'])
 
     # --- MODIFIED METHOD (Start) ---
-    def start_login(self):
+    def start_login(self, event=None):
+        # Guard against double submission if the button is already disabled (login in progress)
+        if self.login_button['state'] == tk.DISABLED:
+            return
+
         first = self.first_name_entry.get().strip()
         last = self.last_name_entry.get().strip()
         password = self.password_entry.get()
@@ -2954,6 +3078,9 @@ class MultiClientApp(tk.Tk):
         self.resizable(True, True)
         self.eval('tk::PlaceWindow . center')
         
+        # Global Enter Key Binding
+        self.bind("<Return>", self.handle_global_return)
+
         self.active_agents = {} 
         self.login_panel = None # Will hold the instance of LoginPanel
         
@@ -3154,6 +3281,24 @@ class MultiClientApp(tk.Tk):
             for agent in list(self.active_agents.values()):
                 agent.sl_agent.stop()
             self.destroy()
+
+    def handle_global_return(self, event):
+        """
+        Handles the Enter key globally. 
+        If the current tab is the LoginPanel, trigger the login.
+        """
+        try:
+            # Check if active tab is the LoginPanel
+            # self.notebook.select() returns the widget name (path) of the selected tab
+            current_tab_id = self.notebook.select()
+            
+            # self.login_panel is the actual widget object. str(self.login_panel) gives its path.
+            if self.login_panel and current_tab_id == str(self.login_panel):
+                 # Call start_login on the LoginPanel
+                 self.login_panel.start_login()
+        except Exception:
+            # In case of any weird focusing or widget state issues, just ignore
+            pass
 
 
 if __name__ == "__main__":
