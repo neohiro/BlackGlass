@@ -8,7 +8,7 @@ It allows for local chat and teleportation (both by double clicking the minimap 
 
 <img width="801" height="679" alt="image" src="https://github.com/user-attachments/assets/33c46de1-8986-45ee-b47d-823e8a762595" />
 
-BlackGlass is a lightweight, high-performance, and "completionist" Second Life client focused on multi-avatar chat management, navigation, and regional awareness. Built with a "Black Glass" aesthetic using Python and Tkinter, it provides a streamlined alternative to heavy 3D viewers for users who prioritize communication and efficiency.
+BlackGlass is a lightweight, high-performance Second Life client focused on multi-avatar chat management, navigation, and regional awareness. Built with a "Black Glass" aesthetic using Python and Tkinter, it provides a streamlined alternative to heavy 3D viewers for users who prioritize communication and efficiency.
 
 🚀 Features
 📨 Advanced Chat & Communication
