@@ -54,7 +54,7 @@ Interactive Sidebar: Real-time event notifications (teleport offers, lures) and 
 Consolidated Login: A dedicated "New Login" tab with saved profile management.
 
 
-🛠️ Requirements
+# 🛠️ Requirements
 Python: 3.7+
 
 Pillow (PIL): Required for minimap image rendering.
@@ -63,17 +63,19 @@ pip install Pillow
 
 Standard Libraries: tkinter, socket, threading, xmlrpc, ssl.
 
-🚀 Getting Started
+# 🚀 Getting Started
 Clone the repository or download BlackGlass.py.
-
+###
+###
 Run the script:
-
+###
 Bash
 python BlackGlass.py
-
+###
 Login: Enter your avatar's First Name, Last Name, and Password.
 Set the Start Region to last, home, or a specific region name.
+###
 Manage Profiles: Your credentials will be saved automatically for quick access in the "Saved Profile" dropdown.
 
-⚖️ Disclaimer
+# ⚖️ Disclaimer
 BlackGlass is an independent project and is not affiliated with, endorsed by, or sponsored by Linden Research (Linden Lab). Use this client at your own risk and ensure compliance with the Second Life Terms of Service.
