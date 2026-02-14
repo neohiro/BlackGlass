@@ -52,6 +52,7 @@ Interactive Sidebar: Real-time event notifications (teleport offers, lures) and 
 
 Consolidated Login: A dedicated "New Login" tab with saved profile management.
 
+
 🛠️ Requirements
 Python: 3.7+
 
@@ -68,10 +69,9 @@ Run the script:
 
 Bash
 python BlackGlass.py
+
 Login: Enter your avatar's First Name, Last Name, and Password.
-
 Set the Start Region to last, home, or a specific region name.
-
 Manage Profiles: Your credentials will be saved automatically for quick access in the "Saved Profile" dropdown.
 
 ⚖️ Disclaimer
