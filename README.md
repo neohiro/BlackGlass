@@ -13,7 +13,7 @@ Download the .exe file on the right in Releases to help test and improve this pr
 
 BlackGlass is a lightweight, high-performance Second Life client focused on multi-avatar chat management, navigation, and regional awareness. Built with a "Black Glass" aesthetic using Python and Tkinter, it provides a streamlined alternative to heavy 3D viewers for users who prioritize communication and efficiency.
 
-#🚀 Features📨 
+🚀 FEATURES📨 
 
 Advanced Chat & Communication
 
