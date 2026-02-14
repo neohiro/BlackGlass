@@ -60,7 +60,7 @@ Consolidated Login: A dedicated "New Login" tab with saved profile management.
 <img width="799" height="677" alt="image" src="https://github.com/user-attachments/assets/ba1c358c-ff1f-4cfc-abf5-3e439991a523" />
 
 # 🛠️ Requirements
-Download the .exe compile at Releases or use Python: 3.7+
+Download and run the .exe compile at Releases or use Python: 3.7+
 
 Pillow (PIL): Required for minimap image rendering.
 
@@ -69,7 +69,7 @@ pip install Pillow
 Standard Libraries: tkinter, socket, threading, xmlrpc, ssl.
 
 # 🚀 Getting Started
-Download the .exe file in Releases or clone the repository or download BlackGlass.py.
+Download and run the .exe file in Releases or clone the repository or download BlackGlass.py.
 ###
 ###
 Run the script:
