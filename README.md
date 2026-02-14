@@ -29,6 +29,7 @@ Display Name Resolution: Asynchronously fetches and caches Second Life Display N
 Reliable Messaging: Implements packet acknowledgement (ACK) tracking to ensure your messages are confirmed by the simulator.
 
 🗺️ Navigation & Minimap
+
 Dynamic Minimap: A real-time 2D radar displaying your position and the locations of nearby avatars.
 
 Visual Map Tiles: Automatically fetches region map tiles from the Second Life Map API.
@@ -38,6 +39,7 @@ Double-Click Teleport: Double-click any location on the minimap to perform a "Ha
 GridSurvey Integration: Uses the Gridsurvey API as a fallback to resolve region coordinates and handles when in-world lookups fail.
 
 🛠️ Technical Prowess
+
 Custom Protocol Implementation: Built-in support for Second Life's Zero-Coding scheme, Low/Medium/High frequency message IDs, and LLSD XML parsing.
 
 Memory Efficiency: Utilizes a LimitedScrolledText widget to prune old chat lines, preventing memory bloat during long sessions.
@@ -47,6 +49,7 @@ Robust Connection: Features automated handshake retries (UseCircuitCode, Complet
 Credential Security: Saves profiles locally using a repeating-key XOR cipher and Base64 encoding for basic password persistence.
 
 📸 Interface Preview
+
 The UI features a high-contrast "Black Glass" theme with:
 
 Cyan-on-Black accents for a futuristic terminal feel.
