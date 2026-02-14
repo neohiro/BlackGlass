@@ -437,7 +437,7 @@ elif sys.platform == "darwin": __PLATFORM_STRING__ = "Mac"
 
 # This is the correct, default login URI from the pyverse authentication.py file
 LOGIN_URI = "https://login.agni.lindenlab.com/cgi-bin/login.cgi" 
-SL_USER_AGENT = "Firestorm-Releasex64/7.1.9.74745 (Second Life; Intel; Windows)"
+SL_USER_AGENT = "BlackGlass 1.1"
 
 def login_to_simulator(firstname, lastname, password, mac=None, start="last", grid=None):
     if grid is None: grid = LOGIN_URI
