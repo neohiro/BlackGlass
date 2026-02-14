@@ -4103,7 +4103,7 @@ class MultiClientApp(tk.Tk):
     """
     def __init__(self):
         super().__init__()
-        self.title("Second Life Multi-Client Chat Viewer")
+        self.title("Black Glass")
         self.geometry("800x650") 
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.resizable(True, True)
@@ -4115,6 +4115,16 @@ class MultiClientApp(tk.Tk):
         self.active_agents = {} 
         self.login_panel = None # Will hold the instance of LoginPanel
         
+        # --- Application Icon ---
+        try:
+             icon_path = "BlackGlass.ico"
+             if os.path.exists(icon_path):
+                 self.iconbitmap(default=icon_path)
+             else:
+                 print("Warning: BlackGlass.ico not found. Using default icon.")
+        except Exception as e:
+             print(f"Warning: Failed to set application icon: {e}")
+
         self._set_style()
         self._create_widgets()
 
