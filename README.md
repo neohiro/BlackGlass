@@ -71,7 +71,6 @@ Download the .exe file in Releases or clone the repository or download BlackGlas
 ###
 Run the script:
 ###
-Bash
 python BlackGlass.py
 ###
 Login: Enter your avatar's First Name, Last Name, and Password.
