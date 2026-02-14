@@ -1,6 +1,6 @@
 # BlackGlass 1.1
 
-<img width="250" height="250" alt="ChatGPT Image Feb 14, 2026, 02_46_18 PM" src="https://github.com/user-attachments/assets/338a9692-3446-439f-8360-9b5044780745" />
+<img width="256" height="256" alt="image" src="https://github.com/user-attachments/assets/0bfe5e2b-0043-466c-afc4-141d5138b68d" />
 
 Black Glass is a new chat viewer for Second Life, boasting a multi client login functionality.
 It allows for local chat and teleportation (both by double clicking the minimap as to another region).
