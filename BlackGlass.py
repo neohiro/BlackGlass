@@ -3032,7 +3032,7 @@ def load_credentials():
 # --- Custom Themed Dialogs (NEW) ---
 
 class ThemedDialog(Toplevel):
-    def __init__(self, parent, title=None):
+    def __init__(self, parent, title=None, topmost=False):
         super().__init__(parent)
         self.transient(parent)
         if title:
@@ -3044,6 +3044,8 @@ class ThemedDialog(Toplevel):
         # Set window properties to adhere to theme
         self.configure(bg='#0A0A0A')
         self.resizable(False, False)
+        if topmost:
+            self.attributes("-topmost", True)
         self.protocol("WM_DELETE_WINDOW", self.cancel)
         
         self.body()
@@ -3096,10 +3098,10 @@ class ThemedMessageBox(ThemedDialog):
     Custom equivalent of messagebox.askyesno, showinfo, etc.
     type_ is 'yesno', 'ok', 'error', 'warning'
     """
-    def __init__(self, parent, title, message, type_='yesno'):
+    def __init__(self, parent, title, message, type_='yesno', topmost=False):
         self.message = message
         self.type = type_
-        super().__init__(parent, title)
+        super().__init__(parent, title, topmost=topmost)
 
     def body(self):
         # Icon can be styled with text or an image if PIL was used, but sticking to text/color for now
@@ -4315,8 +4317,18 @@ class MultiClientApp(tk.Tk):
             
     def on_closing(self):
         """Handles closing the main window by logging out all agents."""
+        # FIX: If the window is minimized, restore it so the dialog can be seen.
+        if self.state() == 'iconic':
+            self.deiconify()
+            self.update()
+
+        # If no agents are logged in, close immediately without prompting
+        if not self.active_agents:
+            self.destroy()
+            return
+
         # MODIFIED: Use ThemedMessageBox instead of messagebox.askyesno
-        dialog_result = ThemedMessageBox(self, "Quit", "Are you sure you want to log out all agents and exit?", 'yesno').result
+        dialog_result = ThemedMessageBox(self, "Quit", "Are you sure you want to log out all agents and exit?", 'yesno', topmost=True).result
         
         if dialog_result:
             for agent in list(self.active_agents.values()):
