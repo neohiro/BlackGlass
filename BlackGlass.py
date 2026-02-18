@@ -459,7 +459,7 @@ def login_to_simulator(firstname, lastname, password, mac=None, start="last", gr
         "last_exec_event": 0,
         "viewer_protocol_version": "2.0.0",
         "channel": "BlackGlass",
-        "version": "7.1.9.74745",
+        "version": "1.2",
         "options": ["inventory-root", "buddy-list", "login-flags", "global-textures", "display-names"]
     })
     if result["login"] != "true":
