@@ -8,6 +8,7 @@ import socket
 import uuid as __uuid__
 import xmlrpc.client
 import hashlib
+import http.cookiejar
 import traceback
 import random
 import ssl
@@ -19,6 +20,8 @@ import base64
 import math
 import urllib.request
 import urllib.parse 
+import re
+import html as html_parser
 from io import BytesIO
 
 # --- PIL/Pillow Import ---
@@ -457,9 +460,9 @@ def login_to_simulator(firstname, lastname, password, mac=None, start="last", gr
         "id0": hashlib.md5(("%s:%s:%s"%(__PLATFORM_STRING__,mac,sys.version)).encode("latin")).hexdigest(),
         "agree_to_tos": True,
         "last_exec_event": 0,
-        "viewer_protocol_version": "2.0.0",
+        "viewer_protocol_version": "1.0.0",
         "channel": "BlackGlass",
-        "version": "1.2",
+        "version": "1.2.0",
         "options": ["inventory-root", "buddy-list", "login-flags", "global-textures", "display-names"]
     })
     if result["login"] != "true":
@@ -650,6 +653,31 @@ class RegionHandshake(BaseMessage):
     }
 registerMessage(RegionHandshake)
 
+class FindAgentReply(BaseMessage):
+    name = "FindAgentReply"; id = 241; freq = 2; trusted = False; zero_coded = True
+    blocks = [("AgentBlock", 1), ("LocationBlock", 0)]
+    structure = {
+        "AgentBlock": [("AgentID", "LLUUID")],
+        "LocationBlock": [("X", "F64"), ("Y", "F64")]
+    }
+registerMessage(FindAgentReply)
+
+class AvatarPropertiesRequest(BaseMessage):
+    name = "AvatarPropertiesRequest"; id = 198; freq = 2; trusted = False; zero_coded = True
+    blocks = [("AgentData", 1)]
+    structure = {"AgentData": [("AgentID", "LLUUID"), ("SessionID", "LLUUID"), ("AvatarID", "LLUUID")]}
+registerMessage(AvatarPropertiesRequest)
+
+class AvatarPropertiesReply(BaseMessage):
+    # FIX: Updated ID to 150 (0x96) based on observed FFFF0096 packets in debug logs
+    name = "AvatarPropertiesReply"; id = 150; freq = 2; trusted = False; zero_coded = True
+    blocks = [("AgentData", 1), ("PropertiesData", 1)]
+    structure = {
+        "AgentData": [("AgentID", "LLUUID"), ("AvatarID", "LLUUID")],
+        "PropertiesData": [("RawData", "Fixed", 13)]
+    }
+registerMessage(AvatarPropertiesReply)
+
 class RegionHandshakeReply(BaseMessage):
     name = "RegionHandshakeReply"; id = 149; freq = 2; trusted = False; zero_coded = True
     blocks = [("AgentData", 1), ("RegionInfo", 1)]
@@ -795,7 +823,17 @@ class TeleportFailed(BaseMessage):
     }
 registerMessage(TeleportFailed)
 
-registerMessage(TeleportFailed)
+class UUIDNameRequest(BaseMessage):
+    name = "UUIDNameRequest"; id = 155; freq = 2; trusted = False; zero_coded = False
+    blocks = [("UUIDNameBlock", 0)]
+    structure = {"UUIDNameBlock": [("ID", "LLUUID")]}
+registerMessage(UUIDNameRequest)
+
+class UUIDNameReply(BaseMessage):
+    name = "UUIDNameReply"; id = 156; freq = 2; trusted = True; zero_coded = False
+    blocks = [("UUIDNameBlock", 0)]
+    structure = {"UUIDNameBlock": [("ID", "LLUUID"), ("FirstName", "Variable", 1), ("LastName", "Variable", 1)]}
+registerMessage(UUIDNameReply)
 
 # --- Map Lookup Messages ---
 
@@ -905,10 +943,11 @@ registerMessage(ObjectUpdateCompressed)
 class CoarseLocationUpdate(BaseMessage):
     # FIX: Medium Frequency (1) for CoarseLocationUpdate
     name = "CoarseLocationUpdate"; id = 6; freq = 1; trusted = False; zero_coded = False
-    blocks = [("Location", 0), ("Index", 0)]
+    blocks = [("Location", 0), ("Index", 0), ("AgentData", 0)]
     structure = {
         "Location": [("X", "U8"), ("Y", "U8"), ("Z", "U8")],
-        "Index": [("You", "S16"), ("Prey", "S16")]
+        "Index": [("You", "S16"), ("Prey", "S16")],
+        "AgentData": [("AgentID", "LLUUID")]
     }
 registerMessage(CoarseLocationUpdate)
 
@@ -1137,6 +1176,7 @@ class RegionClient:
         self.debug = debug
         self.log_callback = log_callback if log_callback is not None else lambda msg: None
         self.other_avatars = [] # Initialize list
+        self.tracked_avatars = {} # NEW: UUID string -> dict of info
         self.local_id = 0 # Reset local_id
         
         if loginToken.get("login") != "true":
@@ -1195,8 +1235,10 @@ class RegionClient:
     
     def log(self, message):
         """Helper function to route messages via the callback."""
-        if self.debug:
-            self.log_callback(f"DEBUG: {message}")
+        if self.log_callback:
+            self.log_callback(message)
+        # Always print to console for "activated debug console output" request
+        print(f"[CLIENT_LOG] {message}")
     
     def send_use_circuit_code(self):
         # *** FIX: Store and reuse the packet and sequence number ***
@@ -1263,11 +1305,12 @@ class RegionClient:
         self.log(f"Sent TeleportRequest to handle {region_handle}")
         return True
 
-    # MODIFIED: Logic added to trigger MAP_FETCH_TRIGGER on RegionHandshake
     def handleInternalPackets(self, pck):
-        if not hasattr(pck.body, 'name'):
-             self.log_callback(f"[SPY] Body Invalid: {type(pck.body)}")
-             return
+        # DETAILED PACKET LOGGING (NEW)
+        if hasattr(pck.body, 'name'):
+            print(f"[DEBUG] Packet: {pck.body.name} (MID: {pck.MID:08X})")
+        else:
+            print(f"[DEBUG] Unknown Packet (MID: {pck.MID:08X})")
             
         if pck.body.name == "UnknownID":
              if self.local_id == 0:
@@ -1318,15 +1361,57 @@ class RegionClient:
                 # Note: FullID might be under 'FullID' or similar depending on the block type
                 # FIX: Use dictionary access and compare UUID bytes or string
                 full_id = block.get("FullID")
+                pcode = block.get("PCode")
                 
                 # DIAGNOSTIC: Log all ObjectUpdate IDs to see if we are missed
 #                 print(f"[OBJ] ObjectUpdate Candidate: {full_id} vs {self.agent_id}")
                 
-                if full_id and str(full_id) == str(self.agent_id):
+                if full_id and str(full_id).lower() == str(self.agent_id).lower():
                     self.local_id = block["ID"]
-#                     print(f"[DEBUG] LocalID Captured from ObjectUpdate: {self.local_id}")
+                    print(f"[VERBOSE] MINIMAP SYNC: LocalID Captured from ObjectUpdate: {self.local_id}")
                     self.log_callback("MINIMAP_UPDATE")
-                    break
+                    
+                    # Also set self position if present
+                    obj_data = block.get("ObjectData", b"")
+                    if hasattr(obj_data, "data"):
+                        obj_data = obj_data.data
+                    if len(obj_data) >= 12:
+                        try:
+                            px, py, pz = struct.unpack("<fff", obj_data[0:12])
+                            if px < 1000 and py < 1000:
+                                self.agent_x, self.agent_y, self.agent_z = px, py, pz
+                        except: pass
+                    
+                # Track other avatars
+                if pcode == 47:
+                    uuid_str = str(full_id) if full_id else None
+                    if not uuid_str: continue
+                    
+                    # STRICT FILTERING: Never track ourselves
+                    if uuid_str.lower() == str(self.agent_id).lower():
+                        continue
+                    
+                    # USE LOWERCASE KEYS FOR CONSISTENCY
+                    uuid_str = uuid_str.lower()
+                    
+                    # Try to extract initial position from ObjectData bytes (12 bytes float vector)
+                    pos = (0, 0, 0)
+                    obj_data = block.get("ObjectData", b"")
+                    if hasattr(obj_data, "data"):
+                        obj_data = obj_data.data
+                    if len(obj_data) >= 12:
+                        try:
+                            px, py, pz = struct.unpack("<fff", obj_data[0:12])
+                            if px < 1000 and py < 1000:
+                                pos = (px, py, pz)
+                        except: pass
+                    
+                    if uuid_str not in self.tracked_avatars:
+                        self.tracked_avatars[uuid_str] = {"pos": pos, "name": "Resolving...", "distance": 0.0, "last_seen": time.time(), "local_id": block.get("ID", 0)}
+                    else:
+                        self.tracked_avatars[uuid_str]["pos"] = pos
+                        self.tracked_avatars[uuid_str]["last_seen"] = time.time()
+                        self.tracked_avatars[uuid_str]["local_id"] = block.get("ID", 0)
 
         elif pck.body.name == "ObjectUpdateCompressed":
             # Handle Compressed Updates - Try to find ourselves in the blob
@@ -1347,41 +1432,13 @@ class RegionClient:
                  found_idx = -1
                  if search_target in data_blob:
                      found_idx = data_blob.find(search_target)
-#                      print(f"[DEBUG] FOUND AGENT UUID (Normal) at offset {found_idx}")
-                 elif search_target_rev in data_blob:
-                     found_idx = data_blob.find(search_target_rev)
-                     # If reversed, we might need to handle LocalID differently if endianness is flipped?
-#                      print(f"[DEBUG] FOUND AGENT UUID (Reversed) at offset {found_idx}")
-                 
-                 if found_idx >= 0:
-                     # Heuristic: LocalID is usually the 4 bytes BEFORE the UUID in some compressed formats, 
-                     # or part of the header. 
-                     # In ObjectUpdateCompressed, UpdateFlags are first.
-                     # Let's dump surrounding bytes to ID the LocalID.
-                     pass
-                     # The structure of ObjectData is: UpdateFlags (U32), Data (Variable).
-                     # The first field in Data IS NOT LocalID?
-                     # Wait. In libomv, ObjectUpdateCompressed.ObjectData class has:
-                     # UpdateFlags, Data.
-                     # Decompressed Data has: UUID, LocalID, PCode, etc. depending on flags.
-                     # UUID is usually near the START if it's sent.
-                     
-                     # If we found UUID at offset `idx`.
-                     # LocalID is typically *before* UUID? Or after?
-                     # Let's try to extract candidates.
-                     
-                     # Diagnostic dump around the UUID
-                     start_dump = max(0, idx - 16)
-                     end_dump = min(len(data_blob), idx + 32)
-#                      print(f"[DEBUG] Dump around UUID:\n{hexdump(data_blob[start_dump:end_dump])}")
-                     
-                     # Heuristic: If we haven't found LocalID yet, try to guess it.
-                     # Usually LocalID is U32.
-                     
-                     # If we assume this is us, let's TRY using it.
-                     # We need to find the LocalID to use Terse updates.
-                     # Let's wait for the heuristic log to tell us where it is structure-wise.
-                     pass
+
+                 if found_idx >= 0 and found_idx + 20 <= len(data_blob):
+                     # In ObjectUpdateCompressed, if FullID is included, LocalID (U32) is immediately after the 16-byte UUID.
+                     guessed_local_id = struct.unpack("<I", data_blob[found_idx+16:found_idx+20])[0]
+                     if self.local_id != guessed_local_id:
+                         print(f"[INFO] Discovered own LocalID from Compressed Update: {guessed_local_id}")
+                         self.local_id = guessed_local_id
             
         elif pck.body.name == "ImprovedTerseObjectUpdate":
             for block in pck.body.ObjectData:
@@ -1415,7 +1472,7 @@ class RegionClient:
                                 if py > 256: py %= 256
                                 
                                 self.agent_x, self.agent_y = px, py
-                                # self.log_callback(f"[CHAT] Own Pos: {px:.1f}, {py:.1f}")
+                                print(f"[DEBUG] Self Pos Terse (uncomp): {self.agent_x}, {self.agent_y}")
                                 self.log_callback("MINIMAP_UPDATE")
                                 break
                             
@@ -1423,7 +1480,7 @@ class RegionClient:
                             px_raw, py_raw = struct.unpack("<HH", data[0:4])
                             px, py = px_raw / 256.0, py_raw / 256.0
                             self.agent_x, self.agent_y = px, py
-                            # self.log_callback(f"[CHAT] Own Pos (comp): {px:.1f}, {py:.1f}")
+                            print(f"[DEBUG] Self Pos Terse (comp): {self.agent_x}, {self.agent_y}")
                             self.log_callback("MINIMAP_UPDATE")
                         except:
                             pass
@@ -1437,19 +1494,41 @@ class RegionClient:
             location_blocks = getattr(pck.body, 'Location', [])
             if not location_blocks:
                 location_blocks = getattr(pck.body, 'AgentData', [])
+                
+            agent_data_blocks = getattr(pck.body, 'AgentData', [])
             
             # Check for the 'Index' block to identify our own avatar
             my_index = -1
             index_blocks = getattr(pck.body, 'Index', [])
             
-            if index_blocks and len(index_blocks) > 0:
-                # The 'You' field in CoarseLocationUpdate/Index is S16
-                raw_index = index_blocks[0].get("You", -1)
-                
-                # REVERTED HACK: Trust the raw index, but only if reasonable positive
-                if raw_index >= 0:
-                    my_index = raw_index
-#                 print(f"[COARSE DEBUG] 'You' Index: {raw_index} -> Used: {my_index} (Locs: {len(location_blocks)})")
+            # --- ROBUST BYTE ALIGNMENT & STRIDE FIX FOR COARSE LOCATION ---
+            # Modern SL simulators include extra fields (like Status) in the AgentData block.
+            # PyOGP's template only knows about AgentID (16 bytes), causing a cumulative drift.
+            # We calculate the real stride (K) by dividing total remaining bytes by avatar count.
+            real_uuids = [None] * len(location_blocks)
+            raw = pck.bytes
+            
+            try:
+                # Structure: [LocCount:U8] [Locs:N*3] [Idx:4] [AgentCount:U8] [Agents:N*Stride]
+                loc_count = raw[0]
+                agent_data_count_pos = 1 + loc_count * 3 + 4
+                if agent_data_count_pos < len(raw):
+                    agent_count = raw[agent_data_count_pos]
+                    blocks_start = agent_data_count_pos + 1
+                    remaining = len(raw) - blocks_start
+                    
+                    if agent_count > 0:
+                        stride = remaining // agent_count
+                        # print(f"[DEBUG] Coarse Stride: {stride} bytes (Expected 16+)")
+                        
+                        import uuid
+                        for idx in range(agent_count):
+                            offset = blocks_start + (idx * stride)
+                            if offset + 16 <= len(raw):
+                                real_uuids[idx] = str(uuid.UUID(bytes=raw[offset:offset+16])).lower()
+            except Exception as e:
+                self.log(f"Error in Coarse stride calculation: {e}")
+            # --- END ROBUST FIX ---
             
             for i, block in enumerate(location_blocks):
                 if 'X' in block and 'Y' in block:
@@ -1457,14 +1536,40 @@ class RegionClient:
                     y = block['Y']
                     z = block.get('Z', 0)
                     
+                    # Fetch dynamically aligned UUID
+                    uuid_str = real_uuids[i] if i < len(real_uuids) else None
+                    
                     # Fix: Ensure my_index is an int and compare correctly
-                    if i == int(my_index):
-                        # print(f"[COARSE DEBUG] Updating SELF pos: {x}, {y}")
-                        # We use Coarse as a fallback for self pos
+                    # NEW: Also treat NULL UUID as 'me' (common for self-position in Coarse packets)
+                    NULL_UUID = "00000000-0000-0000-0000-000000000000"
+                    is_me = (i == int(my_index))
+                    if uuid_str:
+                        if uuid_str.lower() == str(self.agent_id).lower() or uuid_str == NULL_UUID:
+                            is_me = True
+                        
+                    if is_me:
+                        # For self-position in CoarseLocationUpdate, we overwrite our coordinates.
+                        # This ensures distances in ChatTab are calculated from the current real position.
                         self.agent_x = float(x)
                         self.agent_y = float(y)
+                        self.agent_z = float(z) * 4.0 # Scale Z by 4
+                        # print(f"[VERBOSE] MINIMAP SYNC: Coarse Self Position Set to -> {self.agent_x}, {self.agent_y}")
                     else:
-                        new_avatars.append((x, y, z))
+                        scaled_z = float(z) * 4.0
+                        new_avatars.append((x, y, scaled_z))
+                        
+                        # --- USE ACTUAL UUID FOR NEARBY LIST UI ---
+                        # STRICT FILTERING: Ensure uuid_str exists and is NOT us (case-insensitive)
+                        if uuid_str:
+                            is_us = (uuid_str.lower() == str(self.agent_id).lower())
+                            if not is_us:
+                                # USE LOWERCASE KEYS FOR CONSISTENCY
+                                uuid_str = uuid_str.lower()
+                                if uuid_str not in self.tracked_avatars:
+                                    self.tracked_avatars[uuid_str] = {"pos": (x,y,scaled_z), "name": "Resolving...", "distance": 0.0, "last_seen": time.time(), "local_id": 0}
+                                else:
+                                    self.tracked_avatars[uuid_str]["pos"] = (x,y,scaled_z)
+                                    self.tracked_avatars[uuid_str]["last_seen"] = time.time()
                 
             self.other_avatars = new_avatars
             self.log_callback("MINIMAP_UPDATE")
@@ -1488,7 +1593,20 @@ class RegionClient:
             
         elif pck.body.name == "RegionHandshake":
             self.handshake_complete = True # Signal that Handshake is done!
-            self.sim['name'] = str(pck.body.RegionInfo["SimName"])
+            
+            # FIX: Safely decode SimName, handling potential missing/null values
+            try:
+                raw_name = pck.body.RegionInfo["SimName"]
+                if hasattr(raw_name, 'data'):
+                    self.sim['name'] = raw_name.data.replace(b'\x00', b'').decode('utf-8', errors='ignore').strip()
+                else:
+                    self.sim['name'] = bytes(raw_name).replace(b'\x00', b'').decode('utf-8', errors='ignore').strip()
+            except Exception as e:
+                self.log(f"Error decoding SimName: {e}")
+                self.sim['name'] = "Unknown Region"
+                
+            if not self.sim['name']:
+                self.sim['name'] = "Unknown Region"
             
             # self.acks.append(self.circuit_sequence) # REMOVED: Correct ACK logic is via received ACKs or PacketAck
             self.circuit_packet = None # No longer need to resend the circuit code
@@ -1516,27 +1634,24 @@ class RegionClient:
             # --- MAP FETCH TRIGGER ---
             # Trigger map fetch whenever a RegionHandshake is successfully processed.
             if PIL_AVAILABLE: 
-                self.ui_callback("status", f"Handshake complete. Fetching map for {self.sim['name']}...")
-                self.fetch_map(self.sim['name'])
+                self.log_callback(f"MAP_FETCH_TRIGGER, {self.sim['name']}")
+                self.log(f"Handshake complete. Requesting map for {self.sim['name']}...")
             else:
-                 self.ui_callback("status", f"Handshake complete. Map unavailable (PIL missing).")
+                 self.log(f"Handshake complete. Map unavailable (PIL missing).")
             # --- END MAP FETCH TRIGGER ---
             
             # --- FIX: Send the successful login status to the UI ---
             self.log_callback(f"HANDSHAKE_COMPLETE, {self.sim['name']}")
 
         elif pck.body.name == "TeleportStart":
-            self.ui_callback("status", "🚀 Teleport sequence started...")
-            self.log("TeleportStart received.")
+            self.log("TeleportStart received. Teleport sequence started...")
 
         elif pck.body.name == "TeleportProgress":
             msg = getattr(pck.body.Info, 'Message', b'').decode('utf-8', errors='ignore').strip()
-            self.ui_callback("status", f"⏳ Teleport progress: {msg}")
             self.log(f"TeleportProgress: {msg}")
 
         elif pck.body.name == "TeleportFailed":
             reason = getattr(pck.body.Info, 'Reason', b'').decode('utf-8', errors='ignore').strip()
-            self.ui_callback("status", f"❌ Teleport Failed: {reason}")
             self.log(f"TeleportFailed: {reason}")
             # --- END FIX ---
             
@@ -1552,6 +1667,62 @@ class RegionClient:
                 self.seed_cap_url = safe_decode_llvariable(pck.body.Info.get("SeedCapability", ""))
                 self.capabilities = {} # Reset caps for the new region
                 self.log(f"Updated Seed Capability to {self.seed_cap_url}")
+                
+        # --- NEW: Catch UUIDNameReply for fast Avatar Name resolution ---
+        elif pck.body.name == "UUIDNameReply":
+            if hasattr(pck.body, 'UUIDNameBlock'):
+                for block in pck.body.UUIDNameBlock:
+                    uid = block.get("ID")
+                    first = safe_decode_llvariable(block.get("FirstName", ""))
+                    last = safe_decode_llvariable(block.get("LastName", ""))
+                    
+                    if uid and first:
+                        uid_str = str(uid)
+                        full_name = f"{first} {last}".strip()
+                        
+                        # Cache the name for general use
+                        # Add a hook to UI callback if necessary (using the same event)
+                        self.ui_callback("update_display_name", (uid_str, full_name))
+                        
+                        # Clean up fetch tracking
+                        if uid_str in self.fetching_names:
+                            self.fetching_names.remove(uid_str)
+        # --- END UUIDNameReply Catch ---
+
+        elif pck.body.name == "AvatarPropertiesReply":
+            # Extract profile info
+            try:
+                # Use safer access for packet body fields
+                agent_data = getattr(pck.body, 'AgentData', {})
+                prop = getattr(pck.body, 'PropertiesData', {})
+                
+                avatar_id = agent_data.get('AvatarID')
+                if not avatar_id:
+                    self.log("[ERROR] AvatarPropertiesReply missing AvatarID")
+                    return
+
+                uid = str(avatar_id).lower()
+                self.log(f"[DEBUG] Profile reply received for {uid}")
+                
+                # We changed PropertiesData to RawData because the simulator sends a non-standard 13-byte payload
+                raw_data = prop.get('RawData', b'')
+                self.log(f"[DEBUG] Raw Properties Data: {raw_data.hex()}")
+                
+                # Without the standard text fields, we will show what we can
+                about = "Profile unavailable. Simulator returned truncated data."
+                born = "Unknown"
+                url = ""
+                
+                self.ui_callback("show_profile", {
+                    "id": uid,
+                    "about": about,
+                    "born": born,
+                    "url": url
+                })
+            except Exception as e:
+                self.log(f"[ERROR] Failed to parse AvatarPropertiesReply: {e}")
+                import traceback
+                print(traceback.format_exc())
 
         if pck.reliable:
             self.acks.append(pck.sequence)
@@ -1765,6 +1936,8 @@ class RegionClient:
                     
                     self.capabilities.update(new_caps)
                     self.log(f"Fetched capabilities: {list(new_caps.keys())}")
+                    # DEBUG: Log all known caps to help identify missing ones
+                    self.log(f"[DEBUG] Total capabilities known: {len(self.capabilities)}")
                 else:
                     self.log(f"Unexpected capability response format: {type(new_caps)}")
             else:
@@ -1811,14 +1984,31 @@ def parse_llsd_xml(xml_str):
         return None
 
 def render_llsd_xml(data):
-    """Simple LLSD XML renderer for arrays of strings or maps."""
-    if isinstance(data, list):
-        items = "".join([f"<string>{s}</string>" for s in data])
-        return f"<llsd><array>{items}</array></llsd>"
-    elif isinstance(data, dict):
-        items = "".join([f"<key>{k}</key><string>{v}</string>" for k, v in data.items()])
-        return f"<llsd><map>{items}</map></llsd>"
-    return ""
+    """
+    Renders a Python structure to LLSD XML.
+    Supports: LLUUID, bool, int, float, str, dict, list.
+    """
+    def _render_node(v):
+        if isinstance(v, bool):
+            return f"<boolean>{'true' if v else 'false'}</boolean>"
+        elif isinstance(v, int):
+            return f"<integer>{v}</integer>"
+        elif isinstance(v, float):
+            return f"<real>{v}</real>"
+        elif isinstance(v, LLUUID):
+            return f"<uuid>{str(v)}</uuid>"
+        elif isinstance(v, dict):
+            inner = "".join([f"<key>{k}</key>{_render_node(val)}" for k, val in v.items()])
+            return f"<map>{inner}</map>"
+        elif isinstance(v, list):
+            inner = "".join([_render_node(val) for val in v])
+            return f"<array>{inner}</array>"
+        else:
+            # Escape XML special characters in strings
+            s = str(v).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            return f"<string>{s}</string>"
+    
+    return f"<llsd>{_render_node(data)}</llsd>"
 
     # RegionClient.teleport_to_region now implemented above
 
@@ -1855,9 +2045,11 @@ class SecondLifeAgent:
         self.current_region_name = ""
         self.current_position = ""
         
-        # NEW: Display Name Caching
+        # NEW: Display Name and Username Caching
         self.display_name_cache = {} # UUID -> DisplayName
+        self.username_cache = {}     # UUID -> Username (e.g. 'sarahlionheart')
         self.fetching_names = set() # Set of UUIDs currently being fetched
+        self.pending_profile_fetches = set() # UUIDs waiting for usernames to fetch web profiles
         
         # Connection credentials
         self.agent_id = None
@@ -1908,7 +2100,10 @@ class SecondLifeAgent:
                 # We still update status/progress here for immediate feedback
                 _, region_name = message.split(", ", 1)
                 self.ui_callback("status", f"🟢 Successfully logged in to {region_name.strip()}!")
-                self.ui_callback("progress", ("RegionHandshake Received", 100))
+                self.ui_callback("progress", ("RegionHandshake", 100))
+                
+                # Verify the region name via Gridsurvey to ensure we have the REAL name (handling redirections)
+                threading.Thread(target=self.verify_region_name, daemon=True).start()
                 
                 # FIX: Forward to debug_callback so ChatTab can trigger map fetch
                 if self.debug_callback:
@@ -1948,7 +2143,7 @@ class SecondLifeAgent:
             
             # Proven headers
             headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/555.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/555.36'
             }
             
             # Proven SSL Context
@@ -2320,7 +2515,17 @@ class SecondLifeAgent:
         """Returns the display name if cached, otherwise starts a fetch and returns fallback."""
         if not source_id: return fallback_name
         
-        uuid_str = str(source_id)
+        uuid_str = str(source_id).lower()
+        
+        # If we have a fallback name (from chat), use it and cache it immediately
+        # This allows the Nearby List to see the chat-resolved name instantly.
+        if fallback_name and fallback_name != "Unknown":
+            # Strip " Resident" suffix for a cleaner look
+            clean_fallback = fallback_name.replace(" Resident", "")
+            if uuid_str not in self.display_name_cache or self.display_name_cache[uuid_str] in ("Resolving...", ""):
+                print(f"[DEBUG] CACHING CHAT NAME: {uuid_str} -> {clean_fallback}")
+                self.display_name_cache[uuid_str] = clean_fallback
+        
         if uuid_str in self.display_name_cache:
             return self.display_name_cache[uuid_str]
             
@@ -2343,24 +2548,189 @@ class SecondLifeAgent:
             
         return fallback_name
 
+    def request_uuid_name(self, uuid_list):
+        """Send a lightweight UUIDNameRequest packet to resolve avatar names."""
+        if not self.client or not self.running or not uuid_list: return
+        
+        # Only request IDs we haven't already fetched or are currently fetching
+        to_fetch = []
+        for uid_str in uuid_list:
+            u_key = uid_str.lower()
+            if u_key not in self.display_name_cache and u_key not in self.fetching_names:
+                to_fetch.append(uid_str)
+                self.fetching_names.add(u_key)
+        
+        if to_fetch:
+            # Construct and send UUIDNameRequest packet
+            msg = getMessageByName("UUIDNameRequest")
+            msg.UUIDNameBlock = []
+            for uid in to_fetch:
+                msg.UUIDNameBlock.append({"ID": LLUUID(uid)})
+            self.client.send(msg, reliable=True)
+            
+            # Also try the HTTP fallback immediately since sometimes UDP packets drop
+            threading.Thread(target=self._fetch_display_names_task, args=(to_fetch,), daemon=True).start()
+
+    def request_avatar_properties(self, avatar_id):
+        """Sends a request for detailed avatar profile properties."""
+        if not self.client or not self.running: return
+        
+        msg = getMessageByName("AvatarPropertiesRequest")
+        msg.AgentData["AgentID"] = self.client.agent_id
+        msg.AgentData["SessionID"] = self.client.session_id
+        msg.AgentData["AvatarID"] = LLUUID(avatar_id)
+        self.log(f"[DEBUG] Sending Profile Request for {avatar_id}")
+        self.client.send(msg, reliable=True)
+        
+        # Priority 1: Grid Capabilities (Modern)
+        if "AvatarProperties" in self.client.capabilities or "AgentProfile" in self.client.capabilities:
+            threading.Thread(target=self._fetch_avatar_properties_cap_task, args=(avatar_id,), daemon=True).start()
+        
+        # Priority 2: Web Fallback (Scraper)
+        uid_key = str(avatar_id).lower()
+        uname = self.username_cache.get(uid_key)
+        if uname:
+            threading.Thread(target=self._fetch_web_profile_task, args=(avatar_id, uname), daemon=True).start()
+        else:
+            self.pending_profile_fetches.add(uid_key)
+            # If we don't have the username yet, request names again for just this one
+            threading.Thread(target=self.request_uuid_name, args=([avatar_id],), daemon=True).start()
+
+    def _fetch_avatar_properties_cap_task(self, avatar_id):
+        """Background task to fetch profile data via modern HTTP capability."""
+        if not self.client: return
+        
+        try:
+            cap_url = self.client.capabilities.get("AvatarProperties") or self.client.capabilities.get("AgentProfile")
+            if not cap_url:
+                self.log(f"[DEBUG] Profile capabilities (AvatarProperties/AgentProfile) NOT FOUND in cache.")
+                return
+            
+            self.log(f"[DEBUG] Fetching grid profile via cap: {cap_url}")
+            
+            headers = {
+                'User-Agent': SL_USER_AGENT,
+                'Accept': 'application/llsd+json, application/llsd+xml',
+                'X-SecondLife-Agent-ID': str(self.agent_id),
+                'X-SecondLife-Session-ID': str(self.session_id)
+            }
+            
+            # 1. Build common query URL format
+            if "?" in cap_url:
+                query_url = f"{cap_url}&avatar_id={avatar_id}"
+            else:
+                query_url = f"{cap_url}?avatar_id={avatar_id}"
+            
+            profile_found = False
+            
+            # --- PHASE 1: Try standard GET (common in OpenSim/certain caps) ---
+            try:
+                req_get = urllib.request.Request(query_url, headers=headers)
+                with urllib.request.urlopen(req_get, timeout=10) as response:
+                    resp_code = response.getcode()
+                    self.log(f"[DEBUG] Profile cap (GET) response code: {resp_code}")
+                    if resp_code == 200:
+                        resp_data = response.read().decode('utf-8')
+                        profile_found = self._parse_and_show_profile_cap(avatar_id, resp_data, cap_url, "grid (GET)")
+            except Exception as e:
+                self.log(f"[DEBUG] GET Profile cap failed: {e}")
+
+            # --- PHASE 2: Try LLSD POST (Standard Linden/modern SL caps) ---
+            if not profile_found:
+                self.log(f"[DEBUG] Trying POST for profile cap: {cap_url}")
+                # FIX: Use LLUUID object so render_llsd_xml uses <uuid> tag
+                payload = render_llsd_xml({'avatar_id': LLUUID(avatar_id)}).encode('utf-8')
+                post_headers = headers.copy()
+                post_headers['Content-Type'] = 'application/llsd+xml'
+                
+                # Use the original cap URL without the query string for POST
+                clean_url = cap_url.split('?')[0]
+                req_post = urllib.request.Request(clean_url, data=payload, headers=post_headers)
+                
+                try:
+                    with urllib.request.urlopen(req_post, timeout=10) as response:
+                        if response.getcode() == 200:
+                            resp_data = response.read().decode('utf-8')
+                            profile_found = self._parse_and_show_profile_cap(avatar_id, resp_data, cap_url, "grid (POST)")
+                except Exception as e:
+                    self.log(f"[DEBUG] POST Profile cap failed: {e}")
+                    
+            # --- PHASE 3: Try PeopleAPI if available (Modern SL) ---
+            if not profile_found and "PeopleAPI" in self.client.capabilities:
+                people_url = self.client.capabilities["PeopleAPI"]
+                self.log(f"[DEBUG] Trying PeopleAPI for profile: {people_url}")
+                # PeopleAPI often uses /agent_id/details/target_id
+                # But we'll try a simpler version first if it matches standard patterns
+                target_details_url = f"{people_url}/{self.agent_id}/details/{avatar_id}"
+                req_people = urllib.request.Request(target_details_url, headers=headers)
+                try:
+                    with urllib.request.urlopen(req_people, timeout=10) as response:
+                        if response.getcode() == 200:
+                            resp_data = response.read().decode('utf-8')
+                            profile_found = self._parse_and_show_profile_cap(avatar_id, resp_data, people_url, "grid (PeopleAPI)")
+                except Exception as e:
+                    self.log(f"[DEBUG] PeopleAPI attempt failed: {e}")
+
+        except Exception as e:
+            self.log(f"Error fetching grid profile cap for {avatar_id}: {e}")
+
+    def _parse_and_show_profile_cap(self, avatar_id, resp_data, cap_url, source_label):
+        """Helper to parse LLSD/JSON profile response and update UI."""
+        if not resp_data: return False
+        
+        try:
+            if resp_data.strip().startswith('<'):
+                data = parse_llsd_xml(resp_data)
+            else:
+                data = json.loads(resp_data)
+            
+            if isinstance(data, dict):
+                # Map common profile fields (handling variations in field names)
+                about = data.get('about') or data.get('AboutText') or data.get('about_text', '')
+                born = data.get('born') or data.get('BornOn') or data.get('born_on', 'Unknown')
+                
+                # Check for empty data
+                if not about and born == "Unknown":
+                    return False
+
+                # Still provide a web URL if we have the username
+                uid_key = str(avatar_id).lower()
+                uname = self.username_cache.get(uid_key, "")
+                profile_url = f"https://my.secondlife.com/{uname}" if uname else ""
+                
+                # Handle list vs string for about in some LLSD versions
+                if isinstance(about, list): about = "\n".join(about)
+                
+                self.log(f"[DEBUG] Profile for {avatar_id} fetched successfully via {source_label}.")
+                self.ui_callback("show_profile", {
+                    "id": avatar_id,
+                    "about": about,
+                    "born": born,
+                    "url": profile_url,
+                    "source": source_label
+                })
+                return True
+        except Exception as e:
+            self.log(f"[DEBUG] Error parsing cap profile: {e}")
+        return False
+
     def _fetch_display_names_task(self, uuids):
-        """Background task to fetch display names."""
+        """Background task to fetch display names (Legacy HTTP method)."""
         if not self.client: return
         
         try:
             # 1. Ensure we have the AvatarsDisplayName capability
             if "AvatarsDisplayName" not in self.client.capabilities and "GetDisplayNames" not in self.client.capabilities:
                 # Add PeopleAPI and GetDisplayNames as fallbacks
-                self.client.fetch_capabilities(["AvatarsDisplayName", "GetDisplayNames", "EventQueueGet", "PeopleAPI"])
+                self.client.fetch_capabilities(["AvatarsDisplayName", "GetDisplayNames", "EventQueueGet", "PeopleAPI", "AvatarProperties", "AgentProfile"])
                 
             cap_url = self.client.capabilities.get("AvatarsDisplayName") or self.client.capabilities.get("GetDisplayNames")
             if not cap_url:
-                self.log("AvatarsDisplayName capability not available.")
-
+                self.log("AvatarsDisplayName capability not available. Relying on UUIDNameReply only.")
                 return
                 
             # 2. Request display names
-            query_url = f"{cap_url}?ids=" + "&ids=".join(uuids)
+            query_url = f"{cap_url}?ids=" + "&ids=".join([str(u) for u in uuids])
             msg = f"Fetching display names from: {query_url}"
             self.log(msg)
             
@@ -2391,9 +2761,20 @@ class SecondLifeAgent:
                                 for agent in data['agents']:
                                     uid = agent.get('id')
                                     dname = agent.get('display_name')
-                                    if uid and dname:
-                                        self.display_name_cache[uid] = dname
-                                        self.ui_callback("update_display_name", (uid, dname))
+                                    uname = agent.get('username')
+                                    if uid:
+                                        if dname:
+                                            self.display_name_cache[uid] = dname
+                                        if uname:
+                                            self.username_cache[uid] = uname
+                                        
+                                        if dname:
+                                            self.ui_callback("update_display_name", (uid, dname))
+                                            
+                                        # Check if we were waiting for this username to fetch a profile
+                                        if uid in self.pending_profile_fetches and uname:
+                                            self.pending_profile_fetches.remove(uid)
+                                            threading.Thread(target=self._fetch_web_profile_task, args=(uid, uname), daemon=True).start()
                             elif 'bad_ids' in data and len(data) == 1:
                                 self.log(f"Display name fetch returned bad_ids: {data['bad_ids']}")
                             else:
@@ -2426,9 +2807,20 @@ class SecondLifeAgent:
                                                 for agent in data_post['agents']:
                                                     uid = agent.get('id')
                                                     dname = agent.get('display_name')
-                                                    if uid and dname:
-                                                        self.display_name_cache[uid] = dname
-                                                        self.ui_callback("update_display_name", (uid, dname))
+                                                    uname = agent.get('username')
+                                                    if uid:
+                                                        if dname:
+                                                            self.display_name_cache[uid] = dname
+                                                        if uname:
+                                                            self.username_cache[uid] = uname
+                                                        
+                                                        if dname:
+                                                            self.ui_callback("update_display_name", (uid, dname))
+
+                                                        # Check if we were waiting for this username to fetch a profile
+                                                        if uid in self.pending_profile_fetches and uname:
+                                                            self.pending_profile_fetches.remove(uid)
+                                                            threading.Thread(target=self._fetch_web_profile_task, args=(uid, uname), daemon=True).start()
             except urllib.error.HTTPError as e:
                 self.log(f"HTTP Error fetching display names: {e.code} {e.reason}")
 
@@ -2445,6 +2837,74 @@ class SecondLifeAgent:
             for uid in uuids:
                 if uid in self.fetching_names:
                     self.fetching_names.remove(uid)
+
+    def _fetch_web_profile_task(self, avatar_id, username):
+        """Background task to scrape profile data from the web as a workaround."""
+        try:
+            self.log(f"[DEBUG] Fetching web profile for {username}...")
+            # Canonical URL without locale to let server handle redirects more naturally
+            url = f"https://my.secondlife.com/{username}"
+            
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+            
+            # Use CookieJar to prevent infinite redirect loops caused by cookie-based redirects
+            cj = http.cookiejar.CookieJar()
+            opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+            
+            req = urllib.request.Request(url, headers=headers)
+            
+            with opener.open(req, timeout=15) as response:
+                html_text = response.read().decode('utf-8', errors='replace')
+                
+                # Extract meta description (often contains Born On and summary)
+                born = "Unknown"
+                meta_desc = re.search(r'<meta\s+name="description"\s+content="([^"]+)"', html_text, re.I)
+                if meta_desc:
+                    desc_content = meta_desc.group(1)
+                    # Example: "SarahLionheart (sarahlionheart) joined Second Life on Jan 1, 2010. ..."
+                    joined_match = re.search(r'joined Second Life on ([^.]+)\.', desc_content)
+                    if joined_match:
+                        born = joined_match.group(1)
+                
+                # Extract Bio
+                about = ""
+                bio_match = re.search(r'<div id="profile-bio-content">\s*(.*?)\s*</div>', html_text, re.S | re.I)
+                if bio_match:
+                    about = bio_match.group(1)
+                    # Clean up HTML tags and entities
+                    about = re.sub(r'<br\s*/?>', '\n', about, flags=re.I)
+                    about = re.sub(r'<[^>]+>', '', about)
+                    about = html_parser.unescape(about).strip()
+                
+                if not about and meta_desc:
+                    # Fallback to meta description if Bio is empty
+                    about = meta_desc.group(1)
+                
+                # REFINEMENT: Filter out generic LL marketing boilerplate
+                boilerplate = "is a resident of Second Life. Join Second Life to connect with"
+                if boilerplate in about:
+                    about = "(No shared biography on web profile)"
+
+                self.log(f"[DEBUG] Web profile for {username} fetched successfully.")
+                self.ui_callback("show_profile", {
+                    "id": avatar_id,
+                    "about": about,
+                    "born": born,
+                    "url": url,
+                    "username": username,
+                    "source": "web"
+                })
+        except Exception as e:
+            self.log(f"Error fetching web profile for {username}: {e}")
+            # Ensure the UI still updates even on web error
+            self.ui_callback("show_profile", {
+                "id": avatar_id,
+                "about": f"Web profile unavailable for @{username}.\n({e})",
+                "born": "Unknown",
+                "url": f"https://my.secondlife.com/{username}",
+                "username": username,
+                "source": "error"
+            })
 
     # MODIFIED: Fix implemented here to ensure MapNameRequest is reliable
     def teleport(self, region_name):
@@ -2519,7 +2979,10 @@ class SecondLifeAgent:
                         # A valid map image should be significantly larger than a few bytes
                         # Error images or small placeholders are often < 2KB
                         if len(map_data) > 2000: 
-                            self.ui_callback("status", f"Map loaded for {region_name}.")
+                            # Use the verified name if available to avoid confusion
+                            display_name = self.current_region_name if self.current_region_name else region_name
+                            self.ui_callback("status", f"Map loaded for {display_name}.")
+                            
                             self.ui_callback("map_image_fetched", map_data)
                             return # Success!
                         else:
@@ -2545,6 +3008,54 @@ class SecondLifeAgent:
         # 3. If all attempts fail
         self.ui_callback("status", f"⚠️ Map unavailable. ({last_error})")
         self.ui_callback("map_image_fetched", None)
+
+    # NEW: Verify region name using Gridsurvey (post-handshake)
+    def verify_region_name(self):
+        """
+        Uses Gridsurvey to verify the real region name based on the current grid coordinates.
+        This handles cases where the RegionHandshake SimName is missing or we were redirected.
+        """
+        if not self.client: return
+        
+        gx = self.client.grid_x
+        gy = self.client.grid_y
+        
+        if gx == 0 and gy == 0:
+            self.log("[Verify] Cannot verify region name: Grid coordinates are 0,0.")
+            return
+
+        self.log(f"[Verify] Verifying region name for coordinates {gx}, {gy}...")
+        
+        # Use our existing lookup method
+        try:
+            info = self._gridsurvey_region_lookup(grid_x=gx, grid_y=gy)
+            
+            if info and 'Name' in info:
+                real_name = info['Name']
+                current = self.client.sim.get('name', 'Unknown')
+                
+                # If the names differ significantly (ignoring case), update and notify
+                if real_name.lower().strip() != current.lower().strip() or current == "Unknown Region":
+                    self.log(f"[Verify] Correction! Handshake said '{current}', but Gridsurvey says '{real_name}'. Updating...")
+                    
+                    # Update Client state
+                    self.client.sim['name'] = real_name
+                    self.current_region_name = real_name
+                    
+                    # Update UI
+                    self.ui_callback("status", f"📍 Verified Location: {real_name}")
+                    
+                    # Also re-trigger map fetch if the name changed
+                    self.fetch_map(real_name)
+                else:
+                    self.log(f"[Verify] Region name confirmed: {real_name}")
+            else:
+                self.log("[Verify] Gridsurvey lookup failed or returned no name.")
+                
+        except Exception as e:
+            self.log(f"[Verify] Error during verification: {e}")
+
+
             
     def fetch_map(self, region_name):
         """Public entry point for fetching the map image."""
@@ -2788,8 +3299,8 @@ class SecondLifeAgent:
         
         self.log(f"Region lookup success: Handle={region_handle}, Sim Tile X={result_block['X']}, Y={result_block['Y']}")
         
-        # Default position in the region: Center (128, 128) at height 30.0
-        position = vector3(128.0, 128.0, 30.0) 
+        # Default position in the region: Center (128, 128) at height 33.0 (adjusted +3m)
+        position = vector3(128.0, 128.0, 33.0) 
 
         self.client.teleport_to_region(region_name, region_handle, position)
         self.ui_callback("status", f"🚀 Teleport request sent for {region_name}. Waiting for confirmation...")
@@ -2799,6 +3310,9 @@ class SecondLifeAgent:
         Performs a 'hard teleport' by logging out and immediately logging back in 
         at the target region and coordinates.
         """
+        # --- Height adjustment (+3m) to prevent falling through floors ---
+        z += 3.0
+        
         self.log(f"Initiating Hard Teleport to '{region_name}' at <{x}, {y}, {z}>...")
         self.ui_callback("status", f"🔄 Relogging to {region_name} ({x}, {y})...")
         
@@ -2893,43 +3407,36 @@ class SecondLifeAgent:
             # --- FIX: Set the initial status to reflect the UDP handshake phase ---
             self.ui_callback("status", "Teleport complete.")
             
-            # --- NEW: Optimistic Map Fetch ---
-            # If we know the region name from the start URI, fetch the map immediately
-            if region_name.startswith("uri:"):
-                try:
-                    # Format: uri:Region%20Name&128&128&30
-                    parts = region_name[4:].split('&')
-                    encoded_name = parts[0]
-                    decoded_name = urllib.parse.unquote(encoded_name)
-                    self.current_region_name = decoded_name # FIX: Store resolved name
-                    self.fetch_map(decoded_name)
-                except:
-                    pass
-            # --- END NEW ---
+            # --- MANDATORY: Resolve final region name from coordinates ---
+            # Login server may redirect us (e.g. if target is down). 
+            # We MUST trust the coordinates in the login token, not the initial URI.
             
-            # --- FALLBACK: Resolve region name from coordinates if not found in URI ---
-            if not self.current_region_name:
-                 # We should have coordinates from the login token (via RegionClient)
-                 gx = self.client.grid_x
-                 gy = self.client.grid_y
+            # We should have coordinates from the login token (via RegionClient)
+            gx = self.client.grid_x
+            gy = self.client.grid_y
+            
+            self.current_region_name = None # Clear any previous assumption
+            
+            if gx and gy:
+                 self.ui_callback("status", f"📍 Verifying region name for coordinates {gx}, {gy}...")
+                 self.log(f"Login: Verifying region name via Gridsurvey for {gx}, {gy}...")
                  
-                 if gx and gy:
-                     self.ui_callback("status", f"📍 Resolving region name for coordinates {gx}, {gy}...")
-                     self.log(f"Login: Region name unknown. Attempting lookup for {gx}, {gy}...")
+                 # Perform blocking lookup (since we are in a thread)
+                 info = self._gridsurvey_region_lookup(grid_x=gx, grid_y=gy)
+                 
+                 if info and 'Name' in info:
+                     self.current_region_name = info['Name']
+                     self.client.sim['name'] = info['Name'] # Pre-populate sim name
+                     self.log(f"Resolved actual region name: '{self.current_region_name}'")
+                     self.ui_callback("status", f"✅ Location verified: {self.current_region_name}")
                      
-                     # Perform blocking lookup (since we are in a thread)
-                     info = self._gridsurvey_region_lookup(grid_x=gx, grid_y=gy)
-                     
-                     if info and 'Name' in info:
-                         self.current_region_name = info['Name']
-                         self.log(f"Resolved region name: '{self.current_region_name}'")
-                         self.ui_callback("status", f"✅ Resolved region: {self.current_region_name}")
-                         
-                         # Also fetch map
-                         self.fetch_map(self.current_region_name)
-                     else:
-                         self.log("Region name lookup failed.")
-                         self.ui_callback("status", "⚠️ Could not resolve region name.")
+                     # Fetch map immediately with the CORRECT name
+                     self.fetch_map(self.current_region_name)
+                 else:
+                     self.log("Region name lookup failed.")
+                     self.ui_callback("status", "⚠️ Could not resolve region name from coordinates.")
+            else:
+                 self.log(f"Login token missing coordinates? gx={gx}, gy={gy}")
             # -------------------------------------------------------------------------
             # --- END FIX ---
             
@@ -3159,43 +3666,178 @@ class ThemedAskString(ThemedDialog):
     """
     Custom equivalent of simpledialog.askstring.
     """
-    def __init__(self, parent, title, prompt):
+    def __init__(self, parent, title, prompt, initialvalue="", topmost=False):
         self.prompt = prompt
+        self.initialvalue = initialvalue
         self.value = None
-        super().__init__(parent, title)
+        super().__init__(parent, title, topmost=topmost)
         
     def body(self):
-        main_frame = ttk.Frame(self, style='BlackGlass.TFrame', padding=15)
-        main_frame.pack(fill='both', expand=True)
+        f = ttk.Frame(self, style='BlackGlass.TFrame')
+        f.pack(padx=20, pady=20, fill=tk.BOTH, expand=True)
         
-        ttk.Label(main_frame, text=self.prompt, style='BlackGlass.TLabel').pack(pady=(0, 5), anchor='w')
+        ttk.Label(f, text=self.prompt, style='BlackGlass.TLabel').pack(pady=(0, 10))
         
-        self.entry = tk.Entry(main_frame, width=40, bg='#2C2C2C', fg='#FFFFFF', insertbackground='white', relief=tk.FLAT, highlightthickness=1, highlightbackground='#555555')
-        self.entry.pack(fill='x')
-        
+        self.entry = tk.Entry(f, font=('Helvetica', 12), 
+                              bg='#2C2C2C', fg='#FFFFFF', 
+                              insertbackground='white', relief=tk.FLAT, highlightthickness=1, highlightbackground='#555555')
+        self.entry.insert(0, self.initialvalue)
+        self.entry.pack(fill=tk.X)
+        self.entry.bind("<Return>", lambda e: self.ok())
         self.initial_focus = self.entry
 
     def buttonbox(self):
-        box = ttk.Frame(self, style='BlackGlass.TFrame', padding=(15, 0, 15, 15))
-        box.pack(fill='x')
+        box = ttk.Frame(self, style='BlackGlass.TFrame')
+        box.pack(padx=10, pady=10)
         
-        ok_button = ttk.Button(box, text="OK", command=self.ok, style='BlackGlass.TButton', width=10)
-        ok_button.pack(side=tk.RIGHT, padx=5)
-        self.bind("<Return>", lambda e: self.ok())
-        
-        cancel_button = ttk.Button(box, text="Cancel", command=self.cancel, style='BlackGlass.TButton', width=10)
-        cancel_button.pack(side=tk.RIGHT, padx=5)
-        self.bind("<Escape>", lambda e: self.cancel())
+        ttk.Button(box, text="OK", width=10, command=self.ok, style='BlackGlass.TButton').pack(side=tk.LEFT, padx=5)
+        ttk.Button(box, text="Cancel", width=10, command=self.cancel, style='BlackGlass.TButton').pack(side=tk.LEFT, padx=5)
 
     def ok(self):
         self.value = self.entry.get().strip()
+        self.result = True
         self.destroy()
 
-    # Public static methods for convenience
     @staticmethod
-    def askstring(parent, title, prompt):
-        d = ThemedAskString(parent, title, prompt)
-        return d.value if d.value else None
+    def askstring(parent, title, prompt, initialvalue="", topmost=False):
+        d = ThemedAskString(parent, title, prompt, initialvalue, topmost)
+        return d.value if d.result else None
+
+class ThemedChoiceDialog(ThemedDialog):
+    """
+    Shows a list of buttons for choices.
+    choices: List of strings.
+    Returns the string chosen or None if cancelled.
+    """
+    def __init__(self, parent, title, prompt, choices, topmost=False):
+        self.prompt = prompt
+        self.choices = choices
+        super().__init__(parent, title, topmost=topmost)
+
+    def body(self):
+        f = ttk.Frame(self, style='BlackGlass.TFrame')
+        f.pack(padx=20, pady=20, fill=tk.BOTH, expand=True)
+        
+        ttk.Label(f, text=self.prompt, style='BlackGlass.TLabel', font=('Helvetica', 10, 'bold')).pack(pady=(0, 15))
+        
+        for choice in self.choices:
+            btn = ttk.Button(f, text=choice, command=lambda c=choice: self.choose(c), style='BlackGlass.TButton')
+            btn.pack(fill=tk.X, pady=2)
+
+    def buttonbox(self):
+        box = ttk.Frame(self, style='BlackGlass.TFrame')
+        box.pack(padx=10, pady=(0, 10))
+        ttk.Button(box, text="Cancel", width=10, command=self.cancel, style='BlackGlass.TButton').pack()
+
+    def choose(self, choice):
+        self.result = choice
+        self.destroy()
+
+    @staticmethod
+    def askchoice(parent, title, prompt, choices, topmost=False):
+        d = ThemedChoiceDialog(parent, title, prompt, choices, topmost)
+        return d.result
+
+class ThemedProfileDialog(Toplevel):
+    """
+    Displays avatar profile information. 
+    Modified to be non-blocking and support dynamic updates from web scraping.
+    """
+    def __init__(self, parent, profile_data, chat_tab, uid_key):
+        super().__init__(parent)
+        self.data = profile_data
+        self.chat_tab = chat_tab
+        self.uid_key = uid_key
+        
+        self.transient(parent)
+        self.title(f"Profile: {profile_data.get('name', 'Unknown')}")
+        self.configure(bg='#0A0A0A')
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        
+        self.setup_ui()
+        
+        # Center the dialog
+        self.update_idletasks()
+        win_w = self.winfo_width()
+        win_h = self.winfo_height()
+        parent_x = parent.winfo_rootx()
+        parent_y = parent.winfo_rooty()
+        parent_w = parent.winfo_width()
+        parent_h = parent.winfo_height()
+        x = parent_x + (parent_w - win_w) // 2
+        y = parent_y + (parent_h - win_h) // 2
+        self.geometry(f'+{x}+{y}')
+        
+        self.focus_set()
+
+    def setup_ui(self):
+        # Clear existing widgets if this is a refresh
+        for child in self.winfo_children():
+            child.destroy()
+            
+        f = ttk.Frame(self, style='BlackGlass.TFrame')
+        f.pack(padx=20, pady=20, fill=tk.BOTH, expand=True)
+        
+        # Profile Header
+        dname = self.data.get('name', 'Unknown')
+        uname = self.data.get('username', '')
+        header_text = f"{dname} (@{uname})" if uname else dname
+            
+        header = ttk.Label(f, text=header_text, style='BlackGlass.TLabel', font=('Helvetica', 14, 'bold'))
+        header.pack(pady=(0, 5), anchor='w')
+        
+        uid_label = ttk.Label(f, text=f"ID: {self.data.get('id', 'Unknown')}", style='BlackGlass.TLabel', font=('Courier', 8), foreground='#888888')
+        uid_label.pack(pady=(0, 15), anchor='w')
+        
+        # Born On
+        ttk.Label(f, text="Born On:", style='BlackGlass.TLabel', font=('Helvetica', 10, 'bold')).pack(anchor='w')
+        ttk.Label(f, text=self.data.get('born', 'Unknown'), style='BlackGlass.TLabel').pack(pady=(0, 10), anchor='w', padx=5)
+        
+        # About
+        ttk.Label(f, text="About/Bio:", style='BlackGlass.TLabel', font=('Helvetica', 10, 'bold')).pack(anchor='w')
+        about_text = self.data.get('about', '')
+        if not about_text.strip():
+            about_text = "(No bio provided)"
+            
+        # Use a text box for About (read only)
+        txt = tk.Text(f, height=8, width=50, bg='#1E1E1E', fg='#CCCCCC', font=('Helvetica', 10),
+                      relief=tk.FLAT, highlightthickness=1, highlightbackground='#333333', wrap=tk.WORD)
+        txt.insert(tk.END, about_text)
+        txt.config(state='disabled')
+        txt.pack(pady=(0, 10), fill=tk.BOTH, expand=True)
+        
+        # URL
+        url = self.data.get('url', '')
+        if url:
+             ttk.Label(f, text="Web Profile:", style='BlackGlass.TLabel', font=('Helvetica', 10, 'bold')).pack(anchor='w')
+             link = ttk.Label(f, text=url, style='BlackGlass.TLabel', foreground='#00FFFF', cursor="hand2")
+             link.pack(anchor='w', padx=5)
+             link.bind("<Button-1>", lambda e: os.startfile(url))
+        
+        # Status / Fetch progress
+        source = self.data.get('source', 'UDP')
+        status_text = f"Source: {source.upper()}"
+        if source == "UDP":
+            status_text += " (Fetching full web profile...)"
+        
+        status = ttk.Label(f, text=status_text, style='BlackGlass.TLabel', font=('Helvetica', 8, 'italic'), foreground='#666666')
+        status.pack(pady=(10, 0), anchor='w')
+
+        # Close button
+        box = ttk.Frame(self, style='BlackGlass.TFrame')
+        box.pack(padx=10, pady=(0, 10))
+        ttk.Button(box, text="Close", width=12, command=self.on_close, style='BlackGlass.TButton').pack()
+
+    def update_data(self, new_data):
+        self.data.update(new_data)
+        self.setup_ui()
+        self.lift() # Bring to front
+
+    def on_close(self):
+        if self.uid_key in self.chat_tab.active_profiles:
+            del self.chat_tab.active_profiles[self.uid_key]
+        self.destroy()
 
 # --- Minimap Widget ---
 class MinimapCanvas(tk.Canvas):
@@ -3451,6 +4093,8 @@ class ChatTab(ttk.Frame):
         self.my_last_name = last
         self.tab_manager = tab_manager 
         
+        self.active_profiles = {} # UUID -> ThemedProfileDialog instance
+        self.nearby_uuids = [] # List of UUIDs corresponding to nearby_avatars_list lines
         self.pending_chat = {} # FIX: Store messages awaiting ACK echo
         
         # Update the agent's callback to target this specific tab
@@ -3462,6 +4106,10 @@ class ChatTab(ttk.Frame):
         self._set_style(master)
         self._create_widgets()
         self._bind_keys() # Movement key bindings
+        
+        # Start periodic nearby avatars refresh
+        self.nearby_avatars_uuids = [] # NEW: Stores UUIDs corresponding to list items
+        self._refresh_nearby_avatars()
         
         # --- ROBUST MAP TRIGGER ---
         # Trigger the map fetch shortly after the tab is created.
@@ -3571,13 +4219,13 @@ class ChatTab(ttk.Frame):
         right_panel_frame.grid_rowconfigure(0, weight=1) # Notifications/Events (EXPAND)
         right_panel_frame.grid_rowconfigure(1, weight=0) # Minimap (FIXED HEIGHT, ALIGNED BOTTOM)
 
-        # 2a. Event Notifications Area (Row 0 - Takes up remaining vertical space)
-        self.notification_area = LimitedScrolledText(right_panel_frame, max_lines=200, state='disabled', wrap=tk.WORD, height=5, 
-                                                     bg='#1C1C1C', fg='#FFFF00', font=('Courier', 9), 
-                                                     width=1, # <--- FIX: Explicitly set a small width so it doesn't push column width
-                                                     relief=tk.FLAT, highlightthickness=1, highlightbackground='#444444')
-        self.notification_area.insert(tk.END, "Event/Lure Notifications Here.\n(e.g., Teleport Offers)")
-        self.notification_area.grid(row=0, column=0, sticky='nsew', pady=(0, 0), padx=0)
+        # 2a. Nearby Avatars Area (Row 0 - Takes up remaining vertical space)
+        self.nearby_avatars_list = tk.Listbox(right_panel_frame, height=5, width=30,
+                                              bg='#1C1C1C', fg='#00FFFF', font=('Courier', 9),
+                                              relief=tk.FLAT, highlightthickness=1, highlightbackground='#444444')
+        self.nearby_avatars_list.insert(tk.END, "Loading nearby avatars...")
+        self.nearby_avatars_list.grid(row=0, column=0, sticky='nsew', pady=(0, 0), padx=0)
+        self.nearby_avatars_list.bind("<Button-1>", self._on_avatar_click)
 
         # 2b. Minimap Wrapper (Row 1 - Fixed at the bottom and forces square aspect)
         # Give it an initial size but let the grid manage its width
@@ -3613,6 +4261,128 @@ class ChatTab(ttk.Frame):
         self._update_status(f"Initialized.")
         # --- END FIX ---
 
+    def _refresh_nearby_avatars(self):
+        """Periodic loop to update the Nearby Avatars list."""
+        if not getattr(self, "sl_agent", None) or not getattr(self.sl_agent, "client", None):
+            self.after(1000, self._refresh_nearby_avatars)
+            return
+
+        tracked = self.sl_agent.client.tracked_avatars
+        my_x, my_y, my_z = self.sl_agent.client.agent_x, self.sl_agent.client.agent_y, self.sl_agent.client.agent_z
+        
+        # Super-paranoid cleanup of own UUID and NULL UUID just in case it sneaked in
+        own_uuid = str(self.sl_agent.client.agent_id).lower()
+        null_uuid = "00000000-0000-0000-0000-000000000000"
+        
+        for k in list(tracked.keys()):
+            if k.lower() == own_uuid or k == null_uuid:
+                try: del tracked[k]
+                except: pass
+        
+        # Prune old avatars
+        now = time.time()
+        to_remove = [k for k, v in tracked.items() if now - v["last_seen"] > 15.0]
+        for k in to_remove:
+            del tracked[k]
+            
+        display_list = []
+        needs_name_fetch = []
+        
+        for uuid_str, data in tracked.items():
+            # Update name if cached (normalized to lowercase)
+            u_key = uuid_str.lower()
+            if data["name"] == "Resolving..." or u_key in self.sl_agent.display_name_cache:
+                current_cache_name = self.sl_agent.display_name_cache.get(u_key)
+                if current_cache_name and current_cache_name != data["name"] and current_cache_name != "Resolving...":
+                    data["name"] = current_cache_name
+                
+            if data["name"] == "Resolving...":
+                needs_name_fetch.append(uuid_str)
+                    
+            # Calculate distance
+            px, py, pz = data["pos"]
+            dist = math.sqrt((my_x - px)**2 + (my_y - py)**2 + (my_z - pz)**2)
+            data["distance"] = dist
+            
+            display_list.append((dist, f"{data['name']} ({dist:.1f}m)", uuid_str))
+            # print(f"[DEBUG] Listing Avatar: {data['name']} (Dist: {dist:.1f}m) UUID: {uuid_str}")
+        
+        # Trigger UUID name fetch for unresolved avatars
+        if needs_name_fetch:
+            # Start a background task so we don't hold up UI thread
+            # Filter ones we've been fetching for too long
+            
+            # Simple retry mechanism: Clear fetching cache every 15s to allow retries
+            if not hasattr(self, '_last_fetch_clear'):
+                self._last_fetch_clear = time.time()
+            if time.time() - self._last_fetch_clear > 15.0:
+                self.sl_agent.fetching_names.clear()
+                self._last_fetch_clear = time.time()
+                
+            threading.Thread(target=self.sl_agent.request_uuid_name, args=(needs_name_fetch,), daemon=True).start()
+            
+        # Sort by distance (dist is index 0)
+        display_list.sort(key=lambda x: x[0])
+        
+        # Update the listbox
+        if hasattr(self, "nearby_avatars_list"):
+            self.nearby_avatars_list.config(state='normal')
+            self.nearby_avatars_list.delete(0, tk.END)
+            self.nearby_avatars_uuids = [] # Reset UUID tracker
+            
+            for dist, item_str, uuid_str in display_list:
+                self.nearby_avatars_list.insert(tk.END, item_str)
+                self.nearby_avatars_uuids.append(uuid_str)
+                
+            if not display_list:
+                self.nearby_avatars_list.insert(tk.END, "No avatars nearby.")
+                
+        # Loop
+        self.after(1000, self._refresh_nearby_avatars)
+
+    def _on_avatar_click(self, event):
+        """Handles single-click on the avatar list to show a context menu."""
+        # Note: We use after(10) to let the selection update first
+        self.after(10, self._process_avatar_click, event)
+
+    def _process_avatar_click(self, event):
+        selection = self.nearby_avatars_list.curselection()
+        if not selection:
+            return
+            
+        idx = selection[0]
+        if idx >= len(self.nearby_avatars_uuids):
+            return
+            
+        target_uuid = self.nearby_avatars_uuids[idx]
+        display_text = self.nearby_avatars_list.get(idx)
+        # Extract name from the string "Name (Dist m)"
+        target_name = display_text.split(" (")[0]
+        
+        # Show Choice Dialog
+        choice = ThemedChoiceDialog.askchoice(
+            self.master, 
+            "Avatar Actions", 
+            f"Actions for {target_name}:", 
+            ["Teleport to", "Profile"]
+        )
+        
+        if choice == "Teleport to":
+            # Lookup coordinates from tracked_avatars
+            tracked = self.sl_agent.client.tracked_avatars
+            if target_uuid in tracked:
+                pos = tracked[target_uuid]["pos"]
+                px, py, pz = pos
+                # Use current region name for hard teleport
+                region = self.sl_agent.current_region_name
+                self.sl_agent.hard_teleport(region, px, py, pz)
+            else:
+                self._append_notification(f"[ERROR] Could not find coordinates for {target_name}.")
+        
+        elif choice == "Profile":
+            self._append_notification(f"[INFO] Fetching profile for {target_name}...")
+            self.sl_agent.request_avatar_properties(target_uuid)
+
     def _start_map_fetch_task(self, region_name):
         """Starts the map image download thread."""
         self._append_notification(f"[INFO] Requesting map tile for {region_name}...")
@@ -3645,10 +4415,10 @@ class ChatTab(ttk.Frame):
             
         except ImportError:
             # Should not happen if Pillow is installed
-            self._append_notification("[FATAL] PIL/Pillow missing. Cannot display map image.")
+            self._update_status("[FATAL] PIL/Pillow missing. Cannot display map image.")
             self.minimap.update_map_image(None) 
         except Exception as e:
-            self._append_notification(f"[ERROR] Failed to process map image data: {e}")
+            self._update_status(f"[ERROR] Failed to process map image data: {e}")
             self.minimap.update_map_image(None)
 
         
@@ -3726,15 +4496,39 @@ class ChatTab(ttk.Frame):
             # This is primarily used for connection/teleport status updates
             self.after(0, self._update_status, message)
         elif update_type == "notification": # NEW: Generic notification handler
-             self.after(0, self._append_notification, message)
+            self.after(0, self._append_notification, message)
+            
+        elif update_type == "show_profile":
+            # message is a dict with id, about, born, url, username, source
+            uid = message.get("id")
+            uid_key = str(uid).lower()
+            name = self.sl_agent.display_name_cache.get(uid_key, "Unknown")
+            message["name"] = name
+            
+            def _create_or_update():
+                if uid_key in self.active_profiles:
+                    # Update existing dialog
+                    dialog = self.active_profiles[uid_key]
+                    if dialog.winfo_exists():
+                        dialog.update_data(message)
+                    else:
+                        # Re-create if it was closed
+                        self.active_profiles[uid_key] = ThemedProfileDialog(self.master, message, self, uid_key)
+                else:
+                    # Create new dialog
+                    self.active_profiles[uid_key] = ThemedProfileDialog(self.master, message, self, uid_key)
+            
+            self.after(0, _create_or_update)
+
         elif update_type == "error":
             # Use custom ThemedMessageBox for critical errors
             self.after(0, lambda: ThemedMessageBox(self.master, f"{self.my_first_name} Error", message, 'error'))
             self.after(0, self._update_status, f"Error: {message}")
             self.after(0, self._set_disconnected_ui) # Disable chat/send on error
         elif update_type == "teleport_offer":
-            # Use the notification area for a non-critical alert, but keep the standard dialog for user action
-            self.after(0, self._append_notification, f"[ALERT] Teleport offer received to {message['region']}.")
+            # Show teleport offer in main chat window instead of notification area
+            alert_msg = f"--- TELEPORT OFFER RECEIVED TO {message['region']} ---"
+            self.after(0, self._append_chat, alert_msg)
             self.after(0, self._show_teleport_offer, message)
         elif update_type == "map_fetch_request":
             # Handle map fetch request triggered by RegionClient
@@ -3755,9 +4549,13 @@ class ChatTab(ttk.Frame):
             # Clear the minimap image (e.g. on logout/teleport start)
             self.after(0, lambda: self.minimap.update_map_image(None))
 
-
     def update_display_name(self, uid, display_name):
         """Updates the UI when a display name is resolved."""
+        # 0. Sync back to the agent's central cache so the Nearby List sees it
+        uid_lower = str(uid).lower()
+        self.sl_agent.display_name_cache[uid_lower] = display_name
+        # print(f"[DEBUG] update_display_name SET CACHE: {uid_lower} -> {display_name}")
+
         # 1. Update the top bar label if it's the current agent
         if self.sl_agent.client and str(self.sl_agent.client.agent_id) == str(uid):
             full_name = f"{self.my_first_name} {self.my_last_name}"
@@ -3785,10 +4583,8 @@ class ChatTab(ttk.Frame):
         self.chat_display.see(tk.END) 
                 
     def _append_notification(self, message):
-        self.notification_area.config(state='normal')
-        self.notification_area.insert(tk.END, message + "\n", 'alert')
-        self.notification_area.config(state='disabled')
-        self.notification_area.see(tk.END) 
+        # Redirect all generic notification appends to the chat window or status bar
+        self._update_status(message) 
         
     def _update_status(self, message):
         self.status_bar.config(text=message, foreground='#FFFFFF') 
@@ -4289,9 +5085,9 @@ class MultiClientApp(tk.Tk):
 
     # --- Communication Handlers ---
     def handle_debug_log(self, message):
-        """Central debug log handler (currently passive)."""
-        # This is where you could insert code to print debug messages or log them to a file.
-        # For now, we will simply pass, but the logic relies on this existing.
+        """Central debug log handler."""
+        # Always print to console
+        print(f"[APPDEBUG] {message}")
         pass 
 
     def handle_agent_update(self, update_type, message):
