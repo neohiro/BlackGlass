@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import scrolledtext, messagebox, simpledialog, Toplevel
+from tkinter import scrolledtext, Toplevel
 import threading
 import time
 import sys
@@ -187,12 +187,7 @@ class quaternion:
 
 rotation = quaternion
 
-class color4U:
-    r = 0; g = 0; b = 0; a = 0
-    def __init__(self, r=0, g=0, b=0, a=0):
-        self.r = r; self.g = g; self.b = b; self.a = a
-    def __bytes__(self):
-        return struct.pack("<BBBB", self.r, self.g, self.b, self.a)
+
 
 class LLUUID:
     UUID = __uuid__.UUID("00000000-0000-0000-0000-000000000000")
@@ -417,11 +412,8 @@ class Constraints:
         self.AGENT_CONTROL_RIGHT_POS = 0x08# Right (D, Arrow Right)
         self.AGENT_CONTROL_UP_POS = 0x10   # Up (E, PageUp)
         self.AGENT_CONTROL_UP_NEG = 0x20   # Down (C, PageDown)
-        self.AGENT_CONTROL_LBUTTON = 0x40
-        self.AGENT_CONTROL_MLBUTTON = 0x80
         self.AGENT_CONTROL_JUMP = 0x100    # Jump (Space)
         self.AGENT_CONTROL_FLY = 0x200     # Fly/Ground Toggle (F)
-        self.AGENT_CONTROL_MOUSELOOK = 0x400 # Mouselook Toggle
         # Full list from constraints.py would go here...
 
 const = Constraints()
@@ -640,10 +632,7 @@ class CompleteAgentMovement(BaseMessage):
 registerMessage(CompleteAgentMovement)
 
 class RegionHandshake(BaseMessage):
-    # FIX: RegionHandshake is LowFrequency (2), ID is 0x105 (261)
-    # The previous ID 148 was incorrect for usage as LowFrequency ID 261?
-    # Actually, let's trust the PACKET ERROR log which looked for 4294902021 (0xFFFF0105).
-    name = "RegionHandshake"; id = 261; freq = 2; trusted = True; zero_coded = True
+    name = "RegionHandshake"; id = 148; freq = 2; trusted = True; zero_coded = True
     blocks = [("RegionInfo", 1), ("RegionInfo2", 1), ("RegionInfo3", 1), ("RegionInfo4", 0)]
     structure = {
         "RegionInfo": [("RegionFlags", "U32"), ("SimAccess", "U8"), ("SimName", "Variable", 1), ("SimOwner", "LLUUID"), ("IsEstateManager", "BOOL"), ("WaterHeight", "F32"), ("BillableFactor", "F32"), ("CacheID", "LLUUID"), ("TerrainBase0", "LLUUID"), ("TerrainBase1", "LLUUID"), ("TerrainBase2", "LLUUID"), ("TerrainBase3", "LLUUID"), ("TerrainDetail0", "LLUUID"), ("TerrainDetail1", "LLUUID"), ("TerrainDetail2", "LLUUID"), ("TerrainDetail3", "LLUUID"), ("TerrainStartHeight00", "F32"), ("TerrainStartHeight01", "F32"), ("TerrainStartHeight10", "F32"), ("TerrainStartHeight11", "F32"), ("TerrainHeightRange00", "F32"), ("TerrainHeightRange01", "F32"), ("TerrainHeightRange10", "F32"), ("TerrainHeightRange11", "F32")],
@@ -663,18 +652,27 @@ class FindAgentReply(BaseMessage):
 registerMessage(FindAgentReply)
 
 class AvatarPropertiesRequest(BaseMessage):
-    name = "AvatarPropertiesRequest"; id = 198; freq = 2; trusted = False; zero_coded = True
+    name = "AvatarPropertiesRequest"; id = 169; freq = 2; trusted = False; zero_coded = False
     blocks = [("AgentData", 1)]
     structure = {"AgentData": [("AgentID", "LLUUID"), ("SessionID", "LLUUID"), ("AvatarID", "LLUUID")]}
 registerMessage(AvatarPropertiesRequest)
 
 class AvatarPropertiesReply(BaseMessage):
-    # FIX: Updated ID to 150 (0x96) based on observed FFFF0096 packets in debug logs
-    name = "AvatarPropertiesReply"; id = 150; freq = 2; trusted = False; zero_coded = True
+    name = "AvatarPropertiesReply"; id = 171; freq = 2; trusted = True; zero_coded = True
     blocks = [("AgentData", 1), ("PropertiesData", 1)]
     structure = {
         "AgentData": [("AgentID", "LLUUID"), ("AvatarID", "LLUUID")],
-        "PropertiesData": [("RawData", "Fixed", 13)]
+        "PropertiesData": [
+            ("ImageID", "LLUUID"),
+            ("FLImageID", "LLUUID"),
+            ("PartnerID", "LLUUID"),
+            ("AboutText", "Variable", 2),
+            ("FLAboutText", "Variable", 1),
+            ("BornOn", "Variable", 1),
+            ("ProfileURL", "Variable", 1),
+            ("CharterMember", "Variable", 1),
+            ("Flags", "U32")
+        ]
     }
 registerMessage(AvatarPropertiesReply)
 
@@ -1041,7 +1039,12 @@ class Packet:
             # DEBUG: Print exact ID resolution
             # print(f"[PACKET DEBUG] MID Raw: {mid_raw} RealID: {realID}")
             
-            self.body = getMessageByID(realID, self.bytes[offset:])
+            try:
+                self.body = getMessageByID(realID, self.bytes[offset:])
+            except struct.error as e:
+                print(f"[APPDEBUG] RAW PACKET CRASH: {e}")
+                print(f"[APPDEBUG] MID {realID} HEX: {self.bytes[offset:].hex()}")
+                raise e
             
             # DEBUG: Diagnose missing body
             if self.body is None:
@@ -1120,9 +1123,9 @@ class Packet:
 # ==========================================
 
 class RegionClient:
-    host = ""; port = 0; clientPort = 0; sock = None
+    host = ""; port = 0; sock = None
     agent_id = None; session_id = None; loginToken = {}
-    nextPing = 0; nextAck = 0; nextAgentUpdate = 0
+    nextAck = 0
     sequence = 1; acks = []
     circuit_code = None; debug = False
     
@@ -1131,6 +1134,7 @@ class RegionClient:
     
     sim = {}
     log_callback = None
+    ui_callback = None
     
     # --- New variables for Handshake Retries ---
     handshake_complete = False
@@ -1157,7 +1161,6 @@ class RegionClient:
     agent_x = 128.0
     agent_y = 128.0
     agent_z = 30.0
-    agent_rot_z = 0.0 # yaw only for minimap (radians)
     
     # NEW: Global Grid Coordinates for Map Fetching
     grid_x = 1000
@@ -1286,24 +1289,7 @@ class RegionClient:
         self.send(msg, reliable=True) 
         return True
 
-    # MODIFIED: Logic moved to _teleport_lookup_task, this is just a stub for Agent usage
-    def teleport_to_region(self, region_name, region_handle, position):
-        """Sends the final TeleportRequest packet."""
-        
-        # Try TeleportRequest (ID 66) instead of TeleportLocationRequest (ID 67)
-        msg = getMessageByName("TeleportRequest")
-        
-        msg.AgentData["AgentID"] = self.agent_id
-        msg.AgentData["SessionID"] = self.session_id
 
-        msg.Info["RegionHandle"] = region_handle
-        msg.Info["Position"] = position
-        msg.Info["LookAt"] = vector3(0.0, 1.0, 0.0)
-
-        # IMPORTANT: TeleportRequest should be reliable and acknowledged
-        self.send(msg, reliable=True)
-        self.log(f"Sent TeleportRequest to handle {region_handle}")
-        return True
 
     def handleInternalPackets(self, pck):
         # DETAILED PACKET LOGGING (NEW)
@@ -1426,7 +1412,7 @@ class RegionClient:
                  
                  # SEARCH for our UUID in the blob
                  search_target = self.agent_id.bytes
-                 search_target_rev = self.agent_id.bytes[::-1]
+                 self.agent_id.bytes[::-1]
 #                  print(f"[DEBUG] Searching for AgentID: {self.agent_id} in blob ({len(data_blob)} bytes)")
                  
                  found_idx = -1
@@ -1495,11 +1481,11 @@ class RegionClient:
             if not location_blocks:
                 location_blocks = getattr(pck.body, 'AgentData', [])
                 
-            agent_data_blocks = getattr(pck.body, 'AgentData', [])
+            getattr(pck.body, 'AgentData', [])
             
             # Check for the 'Index' block to identify our own avatar
             my_index = -1
-            index_blocks = getattr(pck.body, 'Index', [])
+            getattr(pck.body, 'Index', [])
             
             # --- ROBUST BYTE ALIGNMENT & STRIDE FIX FOR COARSE LOCATION ---
             # Modern SL simulators include extra fields (like Status) in the AgentData block.
@@ -1704,14 +1690,24 @@ class RegionClient:
                 uid = str(avatar_id).lower()
                 self.log(f"[DEBUG] Profile reply received for {uid}")
                 
-                # We changed PropertiesData to RawData because the simulator sends a non-standard 13-byte payload
-                raw_data = prop.get('RawData', b'')
-                self.log(f"[DEBUG] Raw Properties Data: {raw_data.hex()}")
+                # We can now parse the full PropertiesData block
+                # Helper to safely extract string from 'Variable' or bytes object
+                def get_str(field_name):
+                    val = prop.get(field_name)
+                    if hasattr(val, 'data'):
+                        return val.data.decode('utf-8', errors='ignore')
+                    elif isinstance(val, (bytes, bytearray)):
+                        return val.decode('utf-8', errors='ignore')
+                    return ""
                 
-                # Without the standard text fields, we will show what we can
-                about = "Profile unavailable. Simulator returned truncated data."
-                born = "Unknown"
-                url = ""
+                about_text = get_str('AboutText')
+                born_on = get_str('BornOn')
+                profile_url = get_str('ProfileURL')
+                
+                # Cleanup null bytes or empty strings
+                about = about_text.strip('\x00').strip() if about_text else "No profile text."
+                born = born_on.strip('\x00').strip() if born_on else "Unknown"
+                url = profile_url.strip('\x00').strip() if profile_url else ""
                 
                 self.ui_callback("show_profile", {
                     "id": uid,
@@ -1883,7 +1879,7 @@ class RegionClient:
                     with urllib.request.urlopen(req, timeout=10) as response:
                         if response.getcode() == 200:
                             return response.read().decode('utf-8')
-                except Exception as ex:
+                except Exception:
 #                     print(f"DEBUG: Fetch attempt failed: {ex}")
                     pass
                 return None
@@ -1979,7 +1975,7 @@ def parse_llsd_xml(xml_str):
             return node.text
             
         return _parse_node(root)
-    except Exception as e:
+    except Exception:
 #         print(f"LLSD XML Parse Error: {e}")
         return None
 
@@ -2043,7 +2039,6 @@ class SecondLifeAgent:
         self.running = False
         self.event_thread = None
         self.current_region_name = ""
-        self.current_position = ""
         
         # NEW: Display Name and Username Caching
         self.display_name_cache = {} # UUID -> DisplayName
@@ -2055,12 +2050,8 @@ class SecondLifeAgent:
         self.agent_id = None
         self.session_id = None
         self.circuit_code = None
-        self.sim_ip = None
-        self.sim_port = None
         self.raw_socket = None
         self.first_name = "" 
-        self.connection_start_time = 0 
-        self.login_step = 0
 
         # NEW: Movement Control State
         self.key_states = {
@@ -2272,7 +2263,6 @@ class SecondLifeAgent:
                     if hasattr(packet.body, 'RegionInfo'):
                         # FIX: Use safe_decode_llvariable on SimName (Variable 1)
                         self.current_region_name = safe_decode_llvariable(packet.body.RegionInfo.get('SimName', 'Connected Region'))
-                    self.current_position = "Landed"
                     
                     # The success message is now handled inside self.log via the HANDSHAKE_COMPLETE trigger
                     self.log(f"HANDSHAKE_COMPLETE, {self.current_region_name}") # FIX: Trigger the UI update
@@ -2351,7 +2341,7 @@ class SecondLifeAgent:
                         l_cost = offer.get("L$Cost", 0)
                         
                         # Extract RegionHandle (U64) to get coordinates early (optional usage)
-                        region_handle = offer.get("RegionHandle", 0)
+                        offer.get("RegionHandle", 0)
 
                         # Send offer data to the UI thread
 
@@ -2463,21 +2453,9 @@ class SecondLifeAgent:
         if self.client: return self.client.sock
         return None
 
-    def send_raw_packet(self, packet_obj):
-        # This is now only used for resending tracked reliable packets
-        if self.client:
-            return self.client.send(packet_obj)
-        return False
+
     
-    def send_complete_movement_raw(self):
-        self.log("Building CompleteAgentMovement packet...")
-        msg = getMessageByName("CompleteAgentMovement")
-        msg.AgentData["AgentID"] = self.agent_id
-        msg.AgentData["SessionID"] = self.session_id
-        msg.AgentData["CircuitCode"] = self.circuit_code
-        # FIX: Ensure it is sent as reliable
-        pck = Packet(sequence=self.client.seq, message=msg, reliable=True, ack=False)
-        self.send_raw_packet(pck)
+
 
 
     def send_chat_raw(self, message, channel=0, chat_type=1): 
@@ -2583,7 +2561,7 @@ class SecondLifeAgent:
         self.client.send(msg, reliable=True)
         
         # Priority 1: Grid Capabilities (Modern)
-        if "AvatarProperties" in self.client.capabilities or "AgentProfile" in self.client.capabilities:
+        if "AvatarProperties" in getattr(self.client, 'capabilities', {}) or "AgentProfile" in getattr(self.client, 'capabilities', {}):
             threading.Thread(target=self._fetch_avatar_properties_cap_task, args=(avatar_id,), daemon=True).start()
         
         # Priority 2: Web Fallback (Scraper)
@@ -2633,27 +2611,42 @@ class SecondLifeAgent:
                         resp_data = response.read().decode('utf-8')
                         profile_found = self._parse_and_show_profile_cap(avatar_id, resp_data, cap_url, "grid (GET)")
             except Exception as e:
-                self.log(f"[DEBUG] GET Profile cap failed: {e}")
+                err_msg = str(e).encode('ascii', errors='replace').decode('ascii')
+                self.log(f"[DEBUG] GET Profile cap failed: {err_msg}")
 
             # --- PHASE 2: Try LLSD POST (Standard Linden/modern SL caps) ---
             if not profile_found:
                 self.log(f"[DEBUG] Trying POST for profile cap: {cap_url}")
-                # FIX: Use LLUUID object so render_llsd_xml uses <uuid> tag
-                payload = render_llsd_xml({'avatar_id': LLUUID(avatar_id)}).encode('utf-8')
-                post_headers = headers.copy()
-                post_headers['Content-Type'] = 'application/llsd+xml'
+                
+                # Payload structures to test
+                payloads_to_try = [
+                    {'avatar_id': LLUUID(avatar_id)},
+                    [LLUUID(avatar_id)],
+                    {'avatar_ids': [LLUUID(avatar_id)]}
+                ]
                 
                 # Use the original cap URL without the query string for POST
                 clean_url = cap_url.split('?')[0]
-                req_post = urllib.request.Request(clean_url, data=payload, headers=post_headers)
                 
-                try:
-                    with urllib.request.urlopen(req_post, timeout=10) as response:
-                        if response.getcode() == 200:
-                            resp_data = response.read().decode('utf-8')
-                            profile_found = self._parse_and_show_profile_cap(avatar_id, resp_data, cap_url, "grid (POST)")
-                except Exception as e:
-                    self.log(f"[DEBUG] POST Profile cap failed: {e}")
+                for attempt_idx, payload_obj in enumerate(payloads_to_try, 1):
+                    self.log(f"[DEBUG] POST Profile attempt {attempt_idx} payload: {payload_obj}")
+                    # FIX: Use LLUUID object so render_llsd_xml uses <uuid> tag
+                    payload = render_llsd_xml(payload_obj).encode('utf-8')
+                    post_headers = headers.copy()
+                    post_headers['Content-Type'] = 'application/llsd+xml'
+                    
+                    req_post = urllib.request.Request(clean_url, data=payload, headers=post_headers)
+                    
+                    try:
+                        with urllib.request.urlopen(req_post, timeout=10) as response:
+                            if response.getcode() == 200:
+                                resp_data = response.read().decode('utf-8')
+                                profile_found = self._parse_and_show_profile_cap(avatar_id, resp_data, cap_url, "grid (POST)")
+                                if profile_found:
+                                    break # Stop trying payloads if we succeeded
+                    except Exception as e:
+                        err_msg = str(e).encode('ascii', errors='replace').decode('ascii')
+                        self.log(f"[DEBUG] POST Profile cap attempt {attempt_idx} failed: {err_msg}")
                     
             # --- PHASE 3: Try PeopleAPI if available (Modern SL) ---
             if not profile_found and "PeopleAPI" in self.client.capabilities:
@@ -2669,10 +2662,12 @@ class SecondLifeAgent:
                             resp_data = response.read().decode('utf-8')
                             profile_found = self._parse_and_show_profile_cap(avatar_id, resp_data, people_url, "grid (PeopleAPI)")
                 except Exception as e:
-                    self.log(f"[DEBUG] PeopleAPI attempt failed: {e}")
+                    err_msg = str(e).encode('ascii', errors='replace').decode('ascii')
+                    self.log(f"[DEBUG] PeopleAPI attempt failed: {err_msg}")
 
         except Exception as e:
-            self.log(f"Error fetching grid profile cap for {avatar_id}: {e}")
+            err_msg = str(e).encode('ascii', errors='replace').decode('ascii')
+            self.log(f"Error fetching grid profile cap for {avatar_id}: {err_msg}")
 
     def _parse_and_show_profile_cap(self, avatar_id, resp_data, cap_url, source_label):
         """Helper to parse LLSD/JSON profile response and update UI."""
@@ -2684,13 +2679,28 @@ class SecondLifeAgent:
             else:
                 data = json.loads(resp_data)
             
+            # Unwrap if it's a list (OpenSim sometimes wraps in an array)
+            if isinstance(data, list) and len(data) > 0:
+                data = data[0]
+                
             if isinstance(data, dict):
+                self.log(f"[DEBUG] Profile cap received dict keys: {list(data.keys())}")
+                
+                # Check if it's nested under 'agents' or the avatar's UUID
+                if 'agents' in data and isinstance(data['agents'], list) and len(data['agents']) > 0:
+                    data = data['agents'][0]
+                elif str(avatar_id) in data and isinstance(data[str(avatar_id)], dict):
+                    data = data[str(avatar_id)]
+                elif str(avatar_id).lower() in data and isinstance(data[str(avatar_id).lower()], dict):
+                    data = data[str(avatar_id).lower()]
+                
                 # Map common profile fields (handling variations in field names)
-                about = data.get('about') or data.get('AboutText') or data.get('about_text', '')
-                born = data.get('born') or data.get('BornOn') or data.get('born_on', 'Unknown')
+                about = data.get('about') or data.get('AboutText') or data.get('about_text') or data.get('profile_about') or ''
+                born = data.get('born') or data.get('BornOn') or data.get('born_on') or 'Unknown'
                 
                 # Check for empty data
                 if not about and born == "Unknown":
+                    self.log(f"[DEBUG] Profile cap missing fields data: {str(data)[:200]}")
                     return False
 
                 # Still provide a web URL if we have the username
@@ -2710,8 +2720,11 @@ class SecondLifeAgent:
                     "source": source_label
                 })
                 return True
+            else:
+                self.log(f"[DEBUG] Profile cap parsed data is NOT a dict. Type: {type(data)}. Raw Data: {resp_data[:200]}")
         except Exception as e:
             self.log(f"[DEBUG] Error parsing cap profile: {e}")
+            self.log(f"[DEBUG] Failing resp_data: {resp_data[:200]}")
         return False
 
     def _fetch_display_names_task(self, uuids):
@@ -2747,13 +2760,14 @@ class SecondLifeAgent:
                 with urllib.request.urlopen(req, timeout=10) as response:
                     if response.getcode() == 200:
                         resp_data = response.read().decode('utf-8')
-                        self.log(f"Raw display name response: {resp_data}")
-
-                        
+                        # DO NOT LOG THE RAW RESPONSE: Windows console throws UnicodeEncodeError on exotic Display Names!
+                        # self.log(f"Raw display name response: {resp_data}")                        
                         if resp_data.strip().startswith('<'):
                             data = parse_llsd_xml(resp_data)
+                            self.log(f"[DEBUG] Parsed LLSD display names: {len(data.get('agents', []))} agents")
                         else:
                             data = json.loads(resp_data)
+                            self.log(f"[DEBUG] Parsed JSON display names: {len(data.get('agents', []))} agents")
                             
                         # Parse standard Display Name response
                         if isinstance(data, dict):
@@ -2763,13 +2777,14 @@ class SecondLifeAgent:
                                     dname = agent.get('display_name')
                                     uname = agent.get('username')
                                     if uid:
+                                        uid_str = str(uid).lower()
                                         if dname:
-                                            self.display_name_cache[uid] = dname
+                                            self.display_name_cache[uid_str] = dname
                                         if uname:
-                                            self.username_cache[uid] = uname
+                                            self.username_cache[uid_str] = uname
                                         
                                         if dname:
-                                            self.ui_callback("update_display_name", (uid, dname))
+                                            self.ui_callback("update_display_name", (uid_str, dname))
                                             
                                         # Check if we were waiting for this username to fetch a profile
                                         if uid in self.pending_profile_fetches and uname:
@@ -2800,8 +2815,10 @@ class SecondLifeAgent:
 
                                             if resp_data_post.strip().startswith('<'):
                                                 data_post = parse_llsd_xml(resp_data_post)
+                                                self.log(f"[DEBUG] POST Parsed LLSD display names: {len(data_post.get('agents', []))} agents")
                                             else:
                                                 data_post = json.loads(resp_data_post)
+                                                self.log(f"[DEBUG] POST Parsed JSON display names: {len(data_post.get('agents', []))} agents")
                                             
                                             if isinstance(data_post, dict) and 'agents' in data_post:
                                                 for agent in data_post['agents']:
@@ -2809,13 +2826,14 @@ class SecondLifeAgent:
                                                     dname = agent.get('display_name')
                                                     uname = agent.get('username')
                                                     if uid:
+                                                        uid_str = str(uid).lower()
                                                         if dname:
-                                                            self.display_name_cache[uid] = dname
+                                                            self.display_name_cache[uid_str] = dname
                                                         if uname:
-                                                            self.username_cache[uid] = uname
+                                                            self.username_cache[uid_str] = uname
                                                         
                                                         if dname:
-                                                            self.ui_callback("update_display_name", (uid, dname))
+                                                            self.ui_callback("update_display_name", (uid_str, dname))
 
                                                         # Check if we were waiting for this username to fetch a profile
                                                         if uid in self.pending_profile_fetches and uname:
@@ -2826,11 +2844,13 @@ class SecondLifeAgent:
 
                 # Try reading error body
                 try:
-                    err_body = e.read().decode('utf-8')
+                    e.read().decode('utf-8')
                 except: pass
                         
         except Exception as e:
-            err = f"Error fetching display names: {e}"
+            # Safely log the exception without throwing UnicodeEncodeError on Windows
+            err_msg = str(e).encode('ascii', errors='replace').decode('ascii')
+            err = f"Error fetching display names: {err_msg}"
             self.log(err)
 #            print(f"ERROR: {err}")
         finally:
@@ -2906,13 +2926,7 @@ class SecondLifeAgent:
                 "source": "error"
             })
 
-    # MODIFIED: Fix implemented here to ensure MapNameRequest is reliable
-    def teleport(self, region_name):
-        self.ui_callback("status", f"Requesting teleport to {region_name}...")
-        if self.client and self.running:
-            # FIX: Execute the blocking lookup logic in a worker thread
-            teleport_thread = threading.Thread(target=self._teleport_lookup_task, args=(region_name,), daemon=True)
-            teleport_thread.start()
+
             
     # MODIFIED: Worker thread target for map image fetching with new robust fallbacks
     def _fetch_map_image_task(self, region_name):
@@ -2996,12 +3010,11 @@ class SecondLifeAgent:
 
             except urllib.error.HTTPError as e:
                 # *** MODIFIED LOGGING: Log specific HTTP error ***
-                error_msg = f"HTTP Error {e.code} fetching map image from {map_url}: {e.reason}"
                 last_error = f"HTTP {e.code}"
                 # Continue to next URL
             except Exception as e:
                 # *** MODIFIED LOGGING: Log general network errors ***
-                error_msg = f"General Error fetching map image from {map_url}: {type(e).__name__}: {e}"
+                f"General Error fetching map image from {map_url}: {type(e).__name__}: {e}"
                 last_error = str(e)
                 # Continue to next URL
         
@@ -3178,132 +3191,7 @@ class SecondLifeAgent:
             self.log(f"[GridSurvey] Lookup error: {type(e).__name__}: {e}")
             return None
             
-    # NEW: Worker thread target for teleport lookup/request
-    def _teleport_lookup_task(self, region_name):
-        """Handles the blocking map lookup and subsequent teleport request with retries.
-        
-        Uses gridsurvey API as a fallback when RegionHandshake is incomplete or
-        MapNameRequest fails.
-        """
-        
-        # NOTE: Teleporting to 'home' or 'last' is handled by the initial login server call
-        # which is outside of this in-world mechanism.
-        if region_name.lower() in ("home", "last"):
-            self.log(f"Cannot use in-world teleport for special regions: '{region_name}'.")
-            self.ui_callback("status", f"❌ Teleport failed: '{region_name}' requires relogging/login-server call.")
-            return
 
-        # --- Decision Point: Choose lookup method based on handshake status ---
-        
-        result_block = None
-        
-        # STRATEGY 1: If handshake is NOT complete, use gridsurvey API directly
-        if not self.client.handshake_complete:
-            self.log(f"RegionHandshake incomplete. Using gridsurvey API for '{region_name}'...")
-            self.ui_callback("status", f"🔍 Looking up {region_name} via gridsurvey (handshake incomplete)...")
-            result_block = self._gridsurvey_region_lookup(region_name)
-            
-            if result_block:
-                self.log(f"GridSurvey lookup succeeded for '{region_name}'")
-            else:
-                self.log(f"GridSurvey lookup failed for '{region_name}'")
-                self.ui_callback("status", f"❌ Teleport failed: Region '{region_name}' not found via gridsurvey.")
-                return
-        
-        # STRATEGY 2: If handshake IS complete, try MapNameRequest first, then fallback to gridsurvey
-        else:
-            self.log(f"RegionHandshake complete. Trying MapNameRequest for '{region_name}'...")
-            self.ui_callback("status", f"🔍 Looking up {region_name}...")
-            
-            # --- Region Lookup with Retry Logic (MapNameRequest) ---
-            
-            target_name_lower = region_name.lower()
-            
-            # 1. Initialize state
-            with self.client.teleport_lookup_lock:
-                self.client.teleport_lookup_target_name = target_name_lower
-                self.client.teleport_lookup_result = None
-                self.client.teleport_lookup_event.clear() # Ensure the event is clear
-                
-            max_attempts = 3
-            wait_per_attempt = 3.0 # Increase wait time for network latency
-
-            for attempt in range(max_attempts):
-                
-                # Send MapNameRequest
-                self.log(f"Sending MapNameRequest (Attempt {attempt+1}/{max_attempts}) for '{region_name}'...")
-                
-                msg_request = getMessageByName("MapNameRequest")
-                msg_request.AgentData["AgentID"] = self.agent_id
-                msg_request.AgentData["SessionID"] = self.session_id
-                
-                # FIX: The 'variable' class handles null-termination automatically from the string
-                
-                if len(region_name) + 1 > 255: 
-                     self.log(f"Region name '{region_name}' is too long.")
-                     self.ui_callback("status", f"❌ Teleport failed: Region name too long.")
-                     return
-                     
-                # FIX: Ensure the Variable field is set with the correctly encoded bytes and type 1
-                # Pass the raw string, the variable class handles encoding.
-                # Standard region names in map lookup are null-terminated.
-                msg_request.RequestData["Name"] = variable(1, region_name, add_null=True) 
-                msg_request.RequestData["Flags"] = 0 
-                
-                # Send the request
-                # *** FIX: MapNameRequest MUST be sent as a reliable packet ***
-                self.client.send(msg_request, reliable=True)
-                
-                # 2. Wait for MapItemReply (blocking the worker thread)
-                if self.client.teleport_lookup_event.wait(wait_per_attempt):
-                    # Event was set, reply was received by the network thread
-                    self.log(f"Region lookup received reply on attempt {attempt+1}.")
-                    break
-                else:
-                    self.log(f"Region lookup timed out on attempt {attempt+1}. Retrying...")
-                    # Loop continues for next attempt
-
-            # --- Process MapNameRequest Result ---
-            
-            # Extract result block safely
-            with self.client.teleport_lookup_lock:
-                result_block = self.client.teleport_lookup_result
-                self.client.teleport_lookup_target_name = None # Clear state
-                self.client.teleport_lookup_result = None 
-                self.client.teleport_lookup_event.clear() # Clear event one final time
-
-            # If MapNameRequest failed, try gridsurvey as fallback
-            if result_block is None:
-                self.log(f"MapNameRequest failed after {max_attempts} attempts. Trying gridsurvey API...")
-                self.ui_callback("status", f"🔄 Retrying lookup via gridsurvey...")
-                result_block = self._gridsurvey_region_lookup(region_name)
-                
-                if result_block:
-                    self.log(f"GridSurvey fallback succeeded for '{region_name}'")
-                else:
-                    self.log(f"GridSurvey fallback also failed for '{region_name}'")
-                    self.ui_callback("status", f"❌ Teleport failed: Region '{region_name}' not found (tried both methods).")
-                    return
-
-        # --- Send Teleport Request (Common Path) ---
-        
-        # At this point, result_block should contain valid region data
-        region_handle = result_block["Handle"]
-        
-        # Update our client's expected destination coordinates immediately
-        # (Handle is y << 32 | x)
-        w_y = region_handle >> 32
-        w_x = region_handle & 0xFFFFFFFF
-        self.client.grid_x = w_x // 256
-        self.client.grid_y = w_y // 256
-        
-        self.log(f"Region lookup success: Handle={region_handle}, Sim Tile X={result_block['X']}, Y={result_block['Y']}")
-        
-        # Default position in the region: Center (128, 128) at height 33.0 (adjusted +3m)
-        position = vector3(128.0, 128.0, 33.0) 
-
-        self.client.teleport_to_region(region_name, region_handle, position)
-        self.ui_callback("status", f"🚀 Teleport request sent for {region_name}. Waiting for confirmation...")
 
     def hard_teleport(self, region_name, x=128, y=128, z=30):
         """
@@ -3386,8 +3274,7 @@ class SecondLifeAgent:
             self.circuit_code = int(login_token['circuit_code'])
             self.agent_id = UUID(login_token['agent_id'])
             self.session_id = UUID(login_token['session_id'])
-            self.sim_ip = login_token.get('sim_ip')
-            self.sim_port = int(login_token.get('sim_port'))
+
             self.first_name = first 
             self.last_name = last
             self.password = password 
@@ -3396,10 +3283,11 @@ class SecondLifeAgent:
             # Always set debug=True in RegionClient so that it sends logs to SecondLifeAgent.log
             # The agent itself will decide whether to pass them to the UI based on debug_callback.
             self.client = RegionClient(login_token, debug=True, log_callback=self.log) 
+            self.client.ui_callback = self.ui_callback
             self.raw_socket = self.get_socket()
             self.log(f"Socket acquisition status: {'Success' if self.raw_socket else 'Failed'}")
 
-            self.connection_start_time = time.time()
+
             self.running = True
             self.event_thread = threading.Thread(target=self._event_handler, daemon=True)
             self.event_thread.start()
@@ -3494,7 +3382,7 @@ def save_credentials(credentials):
             json.dump(data, f, indent=4)
             
         return True
-    except Exception as e:
+    except Exception:
 #         print(f"Error saving credentials: {e}")
         return False
 
@@ -3528,7 +3416,7 @@ def load_credentials():
                 continue
                 
         return decrypted_data
-    except Exception as e:
+    except Exception:
 #         print(f"Error loading credentials (file corrupted?): {e}")
         return []
 
@@ -3853,10 +3741,7 @@ class MinimapCanvas(tk.Canvas):
         self.source_image = None # NEW: Store original PIL image
         self.map_image = None # Tkinter PhotoImage object for the map tile
         self.last_size = (0, 0) # NEW: Track size to avoid redundant resizing
-        # NEW: Placeholder image if PIL is not available
-        self.placeholder_image = self._create_placeholder_image() if PIL_AVAILABLE else None
         self.bind("<Configure>", self.on_resize)
-        self.last_update_time = 0
         self.bind("<Double-Button-1>", self.on_double_click)
         self.after(1000, self.draw_map) # Start the drawing loop (1 FPS)
 
@@ -3912,7 +3797,7 @@ class MinimapCanvas(tk.Canvas):
         self.agent.log(f"DEBUG: LocalTeleport - Grid: {gx},{gy} Sim: {sim_x:.1f},{sim_y:.1f} Handle: {region_handle} (0x{region_handle:X})")
         
         # Create target position vector
-        target_pos = vector3(sim_x, sim_y, current_z)
+        vector3(sim_x, sim_y, current_z)
         
         
         region_name = self.agent.current_region_name
@@ -3945,22 +3830,7 @@ class MinimapCanvas(tk.Canvas):
         self.last_size = (0, 0) # Force re-render
         self.draw_map()
 
-    def _create_placeholder_image(self):
-        """Creates a default green circle image for the agent, using PIL."""
-        if not PIL_AVAILABLE: return None
-        
-        size = 10 
-        img = Image.new('RGBA', (size * 2, size * 2), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-        # Draw a bright green circle in the center
-        draw.ellipse((0, 0, size * 2 - 1, size * 2 - 1), fill="#00FF00", outline="#00FF00")
-        
-        # Draw an arrow pointing up (representing direction)
-        # Arrow: Top center, slightly below center, bottom center
-        #draw.polygon([(size, 0), (size * 2, size), (0, size)], fill="#FFFFFF")
-        
-        # Save as a Tkinter object
-        return ImageTk.PhotoImage(img)
+
 
 
     def on_resize(self, event):
@@ -4038,7 +3908,7 @@ class MinimapCanvas(tk.Canvas):
         if self.agent.client and self.agent.running:
             for coords in self.agent.client.other_avatars:
                 # Coarse coords are (x, y, z)
-                ox, oy, oz = coords
+                ox, oy, _ = coords
                 
                 # Apply scaling and offsets
                 x_other = ox * scale + offset_x
@@ -4054,7 +3924,6 @@ class MinimapCanvas(tk.Canvas):
             # Agent Position (AgentUpdate/ImprovedTerseObjectUpdate is 0-256)
             agent_x_sl = self.agent.client.agent_x 
             agent_y_sl = self.agent.client.agent_y 
-            agent_rot_z = self.agent.client.agent_rot_z # Yaw in radians
     
             # Map to Canvas: X is proportional, Y is inverted (256-Y)
             # Apply scaling and offsets
@@ -4094,7 +3963,6 @@ class ChatTab(ttk.Frame):
         self.tab_manager = tab_manager 
         
         self.active_profiles = {} # UUID -> ThemedProfileDialog instance
-        self.nearby_uuids = [] # List of UUIDs corresponding to nearby_avatars_list lines
         self.pending_chat = {} # FIX: Store messages awaiting ACK echo
         
         # Update the agent's callback to target this specific tab
@@ -4124,7 +3992,7 @@ class ChatTab(ttk.Frame):
         # --------------------------
 
     def _set_style(self, master):
-        s = ttk.Style(master)
+        ttk.Style(master)
         # Note: ChatTab relies on the styles defined in MultiClientApp
         
     # --- Helper to enforce square minimap ---
@@ -4201,7 +4069,7 @@ class ChatTab(ttk.Frame):
 
         # 1. Chat Display (Column 0, Row 0 - Expanding)
         self.chat_display = LimitedScrolledText(main_content_frame, max_lines=500, state='disabled', wrap=tk.WORD, height=15, 
-                                                     bg='#1C1C1C', fg='#E0E0E0', font=('Courier', 10), 
+                                                     bg='#1C1C1C', fg='#E0E0E0', font=('Courier', 12), 
                                                      insertbackground='white', 
                                                      relief=tk.FLAT, highlightthickness=1, highlightbackground='#444444')
         self.chat_display.grid(row=0, column=0, sticky='nsew', padx=(0, 0))
@@ -4221,7 +4089,7 @@ class ChatTab(ttk.Frame):
 
         # 2a. Nearby Avatars Area (Row 0 - Takes up remaining vertical space)
         self.nearby_avatars_list = tk.Listbox(right_panel_frame, height=5, width=30,
-                                              bg='#1C1C1C', fg='#00FFFF', font=('Courier', 9),
+                                              bg='#1C1C1C', fg='#00FFFF', font=('Courier', 10),
                                               relief=tk.FLAT, highlightthickness=1, highlightbackground='#444444')
         self.nearby_avatars_list.insert(tk.END, "Loading nearby avatars...")
         self.nearby_avatars_list.grid(row=0, column=0, sticky='nsew', pady=(0, 0), padx=0)
@@ -4248,7 +4116,7 @@ class ChatTab(ttk.Frame):
         input_frame = ttk.Frame(self, style='BlackGlass.TFrame')
         input_frame.pack(padx=10, pady=(0, 10), fill=tk.X)
         
-        self.message_entry = tk.Entry(input_frame, font=('Helvetica', 12), 
+        self.message_entry = tk.Entry(input_frame, font=('Courier', 16), 
                                       bg='#2C2C2C', fg='#FFFFFF', 
                                       insertbackground='white', relief=tk.FLAT, highlightthickness=1, highlightbackground='#555555')
         self.message_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
@@ -4291,10 +4159,9 @@ class ChatTab(ttk.Frame):
         for uuid_str, data in tracked.items():
             # Update name if cached (normalized to lowercase)
             u_key = uuid_str.lower()
-            if data["name"] == "Resolving..." or u_key in self.sl_agent.display_name_cache:
-                current_cache_name = self.sl_agent.display_name_cache.get(u_key)
-                if current_cache_name and current_cache_name != data["name"] and current_cache_name != "Resolving...":
-                    data["name"] = current_cache_name
+            current_cache_name = self.sl_agent.display_name_cache.get(u_key)
+            if current_cache_name and current_cache_name != "Resolving...":
+                data["name"] = current_cache_name
                 
             if data["name"] == "Resolving...":
                 needs_name_fetch.append(uuid_str)
@@ -4554,7 +4421,7 @@ class ChatTab(ttk.Frame):
         # 0. Sync back to the agent's central cache so the Nearby List sees it
         uid_lower = str(uid).lower()
         self.sl_agent.display_name_cache[uid_lower] = display_name
-        # print(f"[DEBUG] update_display_name SET CACHE: {uid_lower} -> {display_name}")
+        print(f"[DEBUG] update_display_name SET CACHE: {uid_lower} -> {display_name}")
 
         # 1. Update the top bar label if it's the current agent
         if self.sl_agent.client and str(self.sl_agent.client.agent_id) == str(uid):
@@ -4888,7 +4755,7 @@ class LoginPanel(ttk.Frame):
              formatted_region_name = f"uri:{encoded_region_name}&128&128&30" 
              
         self.login_thread = threading.Thread(target=self.app_instance.login_task, 
-                                             args=(first, last, password, formatted_region_name, self), 
+                                             args=(first, last, password, formatted_region_name), 
                                              daemon=True)
         self.login_thread.start()
     # --- MODIFIED METHOD (End) ---
@@ -4979,39 +4846,10 @@ class MultiClientApp(tk.Tk):
         self.login_panel = LoginPanel(self.notebook, self)
         self.notebook.add(self.login_panel, text="➕ New Login")
 
-    # --- FIXED METHOD: Added robust error handling and simplified selection ---
-    def reload_login_tab(self):
-        """Reloads the login panel to refresh the saved profiles dropdown."""
-        
-        # 1. Save old reference and state
-        old_panel = self.login_panel
-        is_selected = self.notebook.select() == str(old_panel)
-        
-        # 2. Remove the old panel
-        try:
-             # Use the old instance reference to ensure removal
-             self.notebook.forget(old_panel) 
-        except tk.TclError:
-             pass
-        
-        # 3. Create the new panel and update the class attribute
-        self.login_panel = LoginPanel(self.notebook, self)
-
-        # 4. Insert the new panel, with a robust fallback
-        try:
-             # Attempt the preferred insertion at index 0
-             self.notebook.insert(0, self.login_panel, text="➕ New Login")
-        except tk.TclError:
-             # If index 0 fails, safely add it to the end (will be index -1)
-             self.notebook.add(self.login_panel, text="➕ New Login")
-        
-        # 5. Set focus back, using the widget instance
-        if is_selected:
-             self.notebook.select(self.login_panel)
-    # --- END FIXED METHOD ---
 
 
-    def login_task(self, first, last, password, region_name, login_panel_instance):
+
+    def login_task(self, first, last, password, region_name):
         """
         Runs in a thread, attempts login, and calls back to the UI thread.
         login_panel_instance is the stale object, all resets must use self.login_panel.
