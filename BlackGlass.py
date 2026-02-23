@@ -2312,6 +2312,11 @@ class SecondLifeAgent:
                             self.log(f"Filtered empty chat message from {from_name}.")
                             continue
                         
+                        # Filter Firestorm LSL Bridge messages
+                        if "Firestorm LSL Bridge" in from_name:
+                            self.log(f"Filtered bridge message from {from_name}.")
+                            continue
+                        
                         # 3. Filter own messages (already displayed when ACK'd)
                         if source_id and source_id == self.client.agent_id:
                             self.log(f"Filtered own message echo from simulator.")
@@ -4171,7 +4176,7 @@ class ChatTab(ttk.Frame):
             dist = math.sqrt((my_x - px)**2 + (my_y - py)**2 + (my_z - pz)**2)
             data["distance"] = dist
             
-            display_list.append((dist, f"{data['name']} ({dist:.1f}m)", uuid_str))
+            display_list.append((dist, f" {data['name']} ({dist:.1f}m)", uuid_str))
             # print(f"[DEBUG] Listing Avatar: {data['name']} (Dist: {dist:.1f}m) UUID: {uuid_str}")
         
         # Trigger UUID name fetch for unresolved avatars
@@ -4223,8 +4228,8 @@ class ChatTab(ttk.Frame):
             
         target_uuid = self.nearby_avatars_uuids[idx]
         display_text = self.nearby_avatars_list.get(idx)
-        # Extract name from the string "Name (Dist m)"
-        target_name = display_text.split(" (")[0]
+        # Extract name from the string " Name (Dist m)" and strip leading space
+        target_name = display_text.split(" (")[0].strip()
         
         # Show Choice Dialog
         choice = ThemedChoiceDialog.askchoice(
