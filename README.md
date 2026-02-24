@@ -1,4 +1,4 @@
-# BlackGlass 1.3
+# BlackGlass 1.4
 
 <img width="256" height="256" alt="image" src="https://github.com/user-attachments/assets/0bfe5e2b-0043-466c-afc4-141d5138b68d" />
 
