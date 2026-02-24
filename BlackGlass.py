@@ -190,19 +190,27 @@ rotation = quaternion
 
 
 class LLUUID:
-    UUID = __uuid__.UUID("00000000-0000-0000-0000-000000000000")
-    def __init__(self, key = "00000000-0000-0000-0000-000000000000"):
-        if type(key) == bytes:
+    def __init__(self, key="00000000-0000-0000-0000-000000000000"):
+        self.UUID = __uuid__.UUID("00000000-0000-0000-0000-000000000000")
+        if isinstance(key, bytes):
             if len(key) == 16:
                 self.UUID = __uuid__.UUID(bytes=key)
-        elif type(key) == str:
-            self.UUID = __uuid__.UUID(key)
+        elif isinstance(key, str):
+            try:
+                self.UUID = __uuid__.UUID(key)
+            except:
+                pass 
         elif isinstance(key, __uuid__.UUID):
             self.UUID = key
+        elif isinstance(key, LLUUID):
+            self.UUID = key.UUID
+
     def __bytes__(self):
         return self.UUID.bytes
     def __str__(self):
         return str(self.UUID)
+    def __hash__(self):
+        return hash(self.UUID)
     def __len__(self):
         return 16
     @property
@@ -586,19 +594,23 @@ class BaseMessage:
                 setattr(self, key[0], outblock)
 
     def __bytes__(self):
-        result = b""
-        for key in self.blocks:
-            if key[1] == 1:
-                tmp = getattr(self, key[0])
-                for value in self.structure[key[0]]:
-                    result += llDecodeType(tmp[value[0]], value[1])
-            else:
-                tmp = getattr(self, key[0])
-                if key[1] == 0: result += struct.pack("B", len(tmp))
-                for item in tmp:
+        try:
+            result = b""
+            for key in self.blocks:
+                if key[1] == 1:
+                    tmp = getattr(self, key[0])
                     for value in self.structure[key[0]]:
-                        result += llDecodeType(item[value[0]], value[1])
-        return result
+                        result += llDecodeType(tmp[value[0]], value[1])
+                else:
+                    tmp = getattr(self, key[0])
+                    if key[1] == 0: result += struct.pack("B", len(tmp))
+                    for item in tmp:
+                        for value in self.structure[key[0]]:
+                            result += llDecodeType(item[value[0]], value[1])
+            return result
+        except Exception as e:
+            print(f"[CRITICAL] BaseMessage.__bytes__ ERROR: {e}")
+            raise e
 
 message_lookup = {}
 def registerMessage(msg):
@@ -1077,46 +1089,47 @@ class Packet:
             if resent: self.resent = True
 
     def __bytes__(self):
-        self.flags = 0
-        body = bytes(self.body)
-        
-        # 1. Zero-coding
-        if self.zero_coded:
-            tmp = zerocode_encode(body)
-            # FIX: The check here should compare encoded length to original body length
-            if len(tmp) >= len(body):
-                self.zero_coded = False; self.flags &= ~0x80 # Don't zero-code if it makes it larger
-                # Re-encode body without zero-coding
-                body = bytes(self.body) 
-            else:
-                self.flags |= 0x80
-                body = tmp
-        
-        # 2. Set Flags
-        if self.reliable: self.flags |= 0x40
-        if self.resent: self.flags |= 0x20
-        if self.ack: self.flags |= 0x10
-        
-        # 3. ACK bytes
-        acks_bytes = b""
-        if self.ack:
-            for i in self.acks: acks_bytes += struct.pack(">I", i)
-            # Only pack the count if there are actual ACKs
-            if len(self.acks) > 0:
-                acks_bytes += struct.pack(">B", len(self.acks)) # Corrected to B (U8) for the count
-            else:
-                self.flags &= ~0x10 # Clear the ACK flag if no ACKs were packed
-                acks_bytes = b""
-        
-        # 4. Message ID (MID)
-        result = b""
-        if self.body.freq == 3: result = struct.pack(">I", self.MID)
-        elif self.body.freq == 2: result = struct.pack(">I", self.MID + 0xFFFF0000)
-        elif self.body.freq == 1: result = struct.pack(">H", self.MID + 0xFF00)
-        elif self.body.freq == 0: result = struct.pack(">B", self.MID)
-        
-        # 5. Full Packet Assembly
-        return struct.pack(">BIB", self.flags, self.sequence, len(self.extra)) + self.extra + result + body + acks_bytes
+        try:
+            self.flags = 0
+            body = bytes(self.body)
+            
+            # 1. Zero-coding
+            if self.zero_coded:
+                tmp = zerocode_encode(body)
+                if len(tmp) >= len(body):
+                    self.zero_coded = False; self.flags &= ~0x80
+                    body = bytes(self.body) 
+                else:
+                    self.flags |= 0x80
+                    body = tmp
+            
+            # 2. Set Flags
+            if self.reliable: self.flags |= 0x40
+            if self.resent: self.flags |= 0x20
+            if self.ack: self.flags |= 0x10
+            
+            # 3. ACK bytes
+            acks_bytes = b""
+            if self.ack:
+                for i in self.acks: acks_bytes += struct.pack(">I", i)
+                if len(self.acks) > 0:
+                    acks_bytes += struct.pack(">B", len(self.acks))
+                else:
+                    self.flags &= ~0x10
+                    acks_bytes = b""
+            
+            # 4. Message ID (MID)
+            result = b""
+            if self.body.freq == 3: result = struct.pack(">I", self.MID)
+            elif self.body.freq == 2: result = struct.pack(">I", self.MID + 0xFFFF0000)
+            elif self.body.freq == 1: result = struct.pack(">H", self.MID + 0xFF00)
+            elif self.body.freq == 0: result = struct.pack(">B", self.MID)
+            
+            # 5. Full Packet Assembly
+            return struct.pack(">BIB", self.flags, self.sequence, len(self.extra)) + self.extra + result + body + acks_bytes
+        except Exception as e:
+            print(f"[CRITICAL] Packet.__bytes__ ERROR: {e}")
+            raise e
 
 # ==========================================
 # SECTION 6: NETWORK LAYER (UDPStream.py as RegionClient)
@@ -1292,12 +1305,6 @@ class RegionClient:
 
 
     def handleInternalPackets(self, pck):
-        # DETAILED PACKET LOGGING (NEW)
-        if hasattr(pck.body, 'name'):
-            print(f"[DEBUG] Packet: {pck.body.name} (MID: {pck.MID:08X})")
-        else:
-            print(f"[DEBUG] Unknown Packet (MID: {pck.MID:08X})")
-            
         if pck.body.name == "UnknownID":
              if self.local_id == 0:
                  self.log_callback(f"[SPY] Unrecognized ID: {pck.MID}")
@@ -1676,9 +1683,8 @@ class RegionClient:
         # --- END UUIDNameReply Catch ---
 
         elif pck.body.name == "AvatarPropertiesReply":
-            # Extract profile info
+            # Extract profile info from LLUDP packet
             try:
-                # Use safer access for packet body fields
                 agent_data = getattr(pck.body, 'AgentData', {})
                 prop = getattr(pck.body, 'PropertiesData', {})
                 
@@ -1690,30 +1696,45 @@ class RegionClient:
                 uid = str(avatar_id).lower()
                 self.log(f"[DEBUG] Profile reply received for {uid}")
                 
-                # We can now parse the full PropertiesData block
                 # Helper to safely extract string from 'Variable' or bytes object
                 def get_str(field_name):
                     val = prop.get(field_name)
-                    if hasattr(val, 'data'):
-                        return val.data.decode('utf-8', errors='ignore')
+                    if val is None: return ""
+                    if hasattr(val, 'data') and isinstance(val.data, bytes):
+                        return val.data.rstrip(b'\x00').decode('utf-8', errors='ignore')
                     elif isinstance(val, (bytes, bytearray)):
-                        return val.decode('utf-8', errors='ignore')
-                    return ""
+                        return val.rstrip(b'\x00').decode('utf-8', errors='ignore')
+                    return str(val).strip('\x00').strip()
+                
+                # Helper to safely extract UUID string from LLUUID object
+                def get_uuid_str(field_name):
+                    val = prop.get(field_name)
+                    if val is None: return ""
+                    # LLUUID has a __bytes__ method; just str() it
+                    return str(val).strip()
                 
                 about_text = get_str('AboutText')
                 born_on = get_str('BornOn')
                 profile_url = get_str('ProfileURL')
+                # ImageID is an LLUUID type, NOT a Variable string
+                image_id = get_uuid_str('ImageID')
+                fl_image_id = get_uuid_str('FLImageID')
                 
-                # Cleanup null bytes or empty strings
-                about = about_text.strip('\x00').strip() if about_text else "No profile text."
-                born = born_on.strip('\x00').strip() if born_on else "Unknown"
-                url = profile_url.strip('\x00').strip() if profile_url else ""
+                # Use a non-empty profile image (prefer ImageID, fallback to FLImageID)
+                final_image_id = image_id if image_id and image_id != '00000000-0000-0000-0000-000000000000' else fl_image_id
                 
+                # Cleanup
+                about = about_text.strip() if about_text else "No profile text."
+                born = born_on.strip() if born_on else "Unknown"
+                url = profile_url.strip() if profile_url else ""
+
                 self.ui_callback("show_profile", {
                     "id": uid,
                     "about": about,
                     "born": born,
-                    "url": url
+                    "url": url,
+                    "image_id": final_image_id,
+                    "source": "LLUDP"
                 })
             except Exception as e:
                 self.log(f"[ERROR] Failed to parse AvatarPropertiesReply: {e}")
@@ -1738,8 +1759,6 @@ class RegionClient:
                 if self.debug: self.log_callback(packetErrorTrace(blob))
                 return None
             
-            # DIAGNOSTIC: Log processed packet ID
-#             print(f"[RAW-RECV] MID: {pck.MID}, Name: {pck.body.name}, Freq: {getattr(pck.body, 'freq', '?')}")
             
             self.handleInternalPackets(pck)
             return pck
@@ -1751,33 +1770,34 @@ class RegionClient:
 
     def send(self, blob, reliable=False): # ADD reliable argument
         if type(blob) is not Packet:
-            # If a Message object is passed, wrap it in a Packet
-            
             # Determine reliability from argument or message property
             if reliable or getattr(blob, 'trusted', False): 
                  reliable = True
                  
-            # Piggyback any accumulated ACKs on this packet
             acks_to_send = self.acks[:255]
             if acks_to_send:
                 self.acks = self.acks[255:]
                 self.nextAck = time.time() + 1
             
-            # Create the packet
-            blob = Packet(sequence=self.seq, message=blob, acks=acks_to_send, ack=bool(acks_to_send), reliable=reliable)
+            try:
+                blob = Packet(sequence=self.seq, message=blob, acks=acks_to_send, ack=bool(acks_to_send), reliable=reliable)
+            except Exception as e:
+                self.log(f"[RAW-UDP-SEND] FATAL PACKET BUILD ERROR: {e}")
+                import traceback
+                self.log(traceback.format_exc())
+                return False
 
-        # NEW: Track outgoing reliable packets
-        # Do not track handshake packets here, they are tracked separately for initial connection
         if blob.reliable and blob.sequence not in [self.circuit_sequence, self.cam_sequence]:
-            # Store the full packet object and the time it was last sent
             self.reliable_packets[blob.sequence] = (blob, time.time())
             
         try:
-            # If blob is a Packet (like self.circuit_packet or self.cam_packet), it is sent as-is.
+            if getattr(blob, 'message', None) and blob.message.name == "AvatarPropertiesRequest":
+                self.log(f"[RAW-UDP-SEND] Sending {blob.message.name} (SEQ: {blob.sequence})")
+                
             self.sock.sendto(bytes(blob), (self.host, self.port))
             return blob.sequence
         except Exception as e: 
-            if self.debug: self.log_callback(f"ERROR: Send error: {e}")
+            self.log(f"ERROR: Send error: {e}")
             return False
 
     def logout(self):
@@ -2558,13 +2578,21 @@ class SecondLifeAgent:
         """Sends a request for detailed avatar profile properties."""
         if not self.client or not self.running: return
         
-        msg = getMessageByName("AvatarPropertiesRequest")
-        msg.AgentData["AgentID"] = self.client.agent_id
-        msg.AgentData["SessionID"] = self.client.session_id
-        msg.AgentData["AvatarID"] = LLUUID(avatar_id)
-        self.log(f"[DEBUG] Sending Profile Request for {avatar_id}")
-        self.client.send(msg, reliable=True)
-        
+        try:
+            msg = getMessageByName("AvatarPropertiesRequest")
+            # Correcting block assignment: msg.AgentData is a dict for single blocks
+            msg.AgentData["AgentID"] = self.client.agent_id
+            msg.AgentData["SessionID"] = self.client.session_id
+            msg.AgentData["AvatarID"] = LLUUID(avatar_id)
+            
+            self.log(f"[DEBUG] Sending Profile Request for {avatar_id}")
+            result = self.client.send(msg, reliable=True)
+            self.log(f"[DEBUG] Profile Request sent over UDP result: {result}")
+        except Exception as e:
+            self.log(f"[DEBUG] CRITICAL ERROR IN PROFILE REQUEST BUILDING: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+            
         # Priority 1: Grid Capabilities (Modern)
         if "AvatarProperties" in getattr(self.client, 'capabilities', {}) or "AgentProfile" in getattr(self.client, 'capabilities', {}):
             threading.Thread(target=self._fetch_avatar_properties_cap_task, args=(avatar_id,), daemon=True).start()
@@ -2625,9 +2653,9 @@ class SecondLifeAgent:
                 
                 # Payload structures to test
                 payloads_to_try = [
-                    {'avatar_id': LLUUID(avatar_id)},
                     [LLUUID(avatar_id)],
-                    {'avatar_ids': [LLUUID(avatar_id)]}
+                    {'avatar_ids': [LLUUID(avatar_id)]},
+                    {'avatar_id': LLUUID(avatar_id)}
                 ]
                 
                 # Use the original cap URL without the query string for POST
@@ -2676,61 +2704,73 @@ class SecondLifeAgent:
 
     def _parse_and_show_profile_cap(self, avatar_id, resp_data, cap_url, source_label):
         """Helper to parse LLSD/JSON profile response and update UI."""
-        if not resp_data: return False
+        if not resp_data or not resp_data.strip(): return False
         
         try:
-            if resp_data.strip().startswith('<'):
+            data = None
+            stripped = resp_data.strip()
+            if stripped.startswith('<'):
+                # Avoid parsing HTML error pages as LLSD
+                if stripped.lower().startswith('<!doctype html') or stripped.lower().startswith('<html'):
+                    self.log(f"[DEBUG] Profile cap returned HTML (likely error page) instead of LLSD.")
+                    return False
                 data = parse_llsd_xml(resp_data)
             else:
-                data = json.loads(resp_data)
+                try:
+                    import json
+                    data = json.loads(resp_data)
+                except:
+                    pass
             
+            if data is None:
+                self.log(f"[DEBUG] Profile cap parsing failed for source {source_label}.")
+                return False
+                
             # Unwrap if it's a list (OpenSim sometimes wraps in an array)
             if isinstance(data, list) and len(data) > 0:
                 data = data[0]
                 
             if isinstance(data, dict):
-                self.log(f"[DEBUG] Profile cap received dict keys: {list(data.keys())}")
-                
-                # Check if it's nested under 'agents' or the avatar's UUID
+                # Check for 'agents' list (standard modern SL profile cap format)
                 if 'agents' in data and isinstance(data['agents'], list) and len(data['agents']) > 0:
                     data = data['agents'][0]
+                # Check for UUID-keyed dict
                 elif str(avatar_id) in data and isinstance(data[str(avatar_id)], dict):
                     data = data[str(avatar_id)]
                 elif str(avatar_id).lower() in data and isinstance(data[str(avatar_id).lower()], dict):
                     data = data[str(avatar_id).lower()]
                 
-                # Map common profile fields (handling variations in field names)
+                # Extract fields
                 about = data.get('about') or data.get('AboutText') or data.get('about_text') or data.get('profile_about') or ''
                 born = data.get('born') or data.get('BornOn') or data.get('born_on') or 'Unknown'
-                
-                # Check for empty data
-                if not about and born == "Unknown":
-                    self.log(f"[DEBUG] Profile cap missing fields data: {str(data)[:200]}")
-                    return False
+                image_id = data.get('image_id') or data.get('ImageID') or data.get('image') or data.get('profile_image') or ''
 
-                # Still provide a web URL if we have the username
+                if not about and born == "Unknown" and not image_id:
+                     self.log(f"[DEBUG] Profile cap returned empty/minimal dict for {avatar_id}.")
+                     return False
+
                 uid_key = str(avatar_id).lower()
                 uname = self.username_cache.get(uid_key, "")
                 profile_url = f"https://my.secondlife.com/{uname}" if uname else ""
                 
-                # Handle list vs string for about in some LLSD versions
                 if isinstance(about, list): about = "\n".join(about)
                 
-                self.log(f"[DEBUG] Profile for {avatar_id} fetched successfully via {source_label}.")
+                self.log(f"[DEBUG] Profile for {avatar_id} fetched via {source_label}.")
                 self.ui_callback("show_profile", {
                     "id": avatar_id,
                     "about": about,
                     "born": born,
                     "url": profile_url,
+                    "image_id": image_id,
                     "source": source_label
                 })
                 return True
             else:
-                self.log(f"[DEBUG] Profile cap parsed data is NOT a dict. Type: {type(data)}. Raw Data: {resp_data[:200]}")
+                self.log(f"[DEBUG] Profile cap parsed data is not a dict ({type(data)}).")
+                return False
         except Exception as e:
-            self.log(f"[DEBUG] Error parsing cap profile: {e}")
-            self.log(f"[DEBUG] Failing resp_data: {resp_data[:200]}")
-        return False
+            self.log(f"Error parsing profile cap response: {e}")
+            return False
 
     def _fetch_display_names_task(self, uuids):
         """Background task to fetch display names (Legacy HTTP method)."""
@@ -2864,69 +2904,99 @@ class SecondLifeAgent:
                     self.fetching_names.remove(uid)
 
     def _fetch_web_profile_task(self, avatar_id, username):
-        """Background task to scrape profile data from the web as a workaround."""
+        """Background task to fetch profile data from world.secondlife.com (no login required)."""
+        # Use world.secondlife.com/resident/{UUID} - publicly accessible, no login needed.
+        # my.secondlife.com requires login cookies and returns an empty login redirect page.
+        public_url = f"https://world.secondlife.com/resident/{avatar_id}"
+        web_url = f"https://my.secondlife.com/{username}"
+        
         try:
-            self.log(f"[DEBUG] Fetching web profile for {username}...")
-            # Canonical URL without locale to let server handle redirects more naturally
-            url = f"https://my.secondlife.com/{username}"
+            self.log(f"[DEBUG] Fetching web profile for {username} ({avatar_id})...")
             
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+            }
             
-            # Use CookieJar to prevent infinite redirect loops caused by cookie-based redirects
-            cj = http.cookiejar.CookieJar()
-            opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+            req = urllib.request.Request(public_url, headers=headers)
             
-            req = urllib.request.Request(url, headers=headers)
-            
-            with opener.open(req, timeout=15) as response:
+            with urllib.request.urlopen(req, timeout=15) as response:
                 html_text = response.read().decode('utf-8', errors='replace')
-                
-                # Extract meta description (often contains Born On and summary)
-                born = "Unknown"
-                meta_desc = re.search(r'<meta\s+name="description"\s+content="([^"]+)"', html_text, re.I)
+            
+            # --- Parse Born On date ---
+            born = "Unknown"
+            # The HTML has "Resident Since: 2006-06-16" possibly with HTML around it
+            # We use re.S and allow any whitespace/tags between the label and date
+            since_match = re.search(r'Resident\s+Since:?\s*(?:<[^>]*>\s*)*([0-9]{4}-[0-9]{2}-[0-9]{2})', html_text, re.I | re.S)
+            if since_match:
+                born = since_match.group(1)
+            else:
+                # Fallback: look for any YYYY-MM-DD date in a 'date' class element
+                date_match = re.search(r'class="[^"]*date[^"]*"[^>]*>\s*(?:<[^>]+>\s*)*([0-9]{4}-[0-9]{2}-[0-9]{2})', html_text, re.I | re.S)
+                if date_match:
+                    born = date_match.group(1)
+            
+            # --- Parse About / Bio ---
+            about = ""
+            # world.secondlife.com uses <div class="bio"> or puts bio inline
+            bio_match = re.search(r'<div[^>]+class=["\'][^"\']*bio[^"\']*["\'][^>]*>(.*?)</div>', html_text, re.S | re.I)
+            if bio_match:
+                raw_bio = bio_match.group(1)
+                about = re.sub(r'<br\s*/?>', '\n', raw_bio, flags=re.I)
+                about = re.sub(r'<[^>]+>', '', about)
+                about = html_parser.unescape(about).strip()
+            
+            if not about:
+                # Fallback: meta description
+                meta_desc = re.search(r'<meta\s+(?:name|property)=["\']description["\'][^>]+content=["\']([^"\']+)["\']', html_text, re.I)
                 if meta_desc:
-                    desc_content = meta_desc.group(1)
-                    # Example: "SarahLionheart (sarahlionheart) joined Second Life on Jan 1, 2010. ..."
-                    joined_match = re.search(r'joined Second Life on ([^.]+)\.', desc_content)
-                    if joined_match:
-                        born = joined_match.group(1)
-                
-                # Extract Bio
+                    about = html_parser.unescape(meta_desc.group(1)).strip()
+            
+            # Filter LL marketing boilerplate
+            if "Second Life. Join Second Life to connect with" in about:
                 about = ""
-                bio_match = re.search(r'<div id="profile-bio-content">\s*(.*?)\s*</div>', html_text, re.S | re.I)
-                if bio_match:
-                    about = bio_match.group(1)
-                    # Clean up HTML tags and entities
-                    about = re.sub(r'<br\s*/?>', '\n', about, flags=re.I)
-                    about = re.sub(r'<[^>]+>', '', about)
-                    about = html_parser.unescape(about).strip()
-                
-                if not about and meta_desc:
-                    # Fallback to meta description if Bio is empty
-                    about = meta_desc.group(1)
-                
-                # REFINEMENT: Filter out generic LL marketing boilerplate
-                boilerplate = "is a resident of Second Life. Join Second Life to connect with"
-                if boilerplate in about:
-                    about = "(No shared biography on web profile)"
-
-                self.log(f"[DEBUG] Web profile for {username} fetched successfully.")
-                self.ui_callback("show_profile", {
-                    "id": avatar_id,
-                    "about": about,
-                    "born": born,
-                    "url": url,
-                    "username": username,
-                    "source": "web"
-                })
-        except Exception as e:
-            self.log(f"Error fetching web profile for {username}: {e}")
-            # Ensure the UI still updates even on web error
+            
+            # --- Parse Image ID ---
+            # world.secondlife.com uses a <meta name="imageid"> tag with the texture UUID
+            # and the picture-service URL is: https://picture-service.secondlife.com/{UUID}/256x192.jpg
+            image_id = ""
+            # Primary: meta imageid tag
+            meta_img = re.search(r'<meta\s+name=["\']imageid["\']\s+content=["\']([a-fA-F0-9\-]{36})["\']', html_text, re.I)
+            if meta_img:
+                image_id = meta_img.group(1)
+            else:
+                # Fallback: picture-service URL
+                ps_match = re.search(r'picture-service\.secondlife\.com/([a-fA-F0-9\-]{36})/', html_text, re.I)
+                if ps_match:
+                    image_id = ps_match.group(1)
+                else:
+                    # Last fallback: /app/image/ format
+                    app_img = re.search(r'/app/image/([a-fA-F0-9\-]{36})/', html_text)
+                    if app_img:
+                        image_id = app_img.group(1)
+            
+            self.log(f"[DEBUG] Web profile for {username} fetched successfully.")
+            
             self.ui_callback("show_profile", {
                 "id": avatar_id,
-                "about": f"Web profile unavailable for @{username}.\n({e})",
+                "about": about or "(No biography shared)",
+                "born": born,
+                "url": web_url,  # Link to the user-facing profile page
+                "image_id": image_id,
+                "username": username,
+                "source": "web"
+            })
+            
+        except Exception as e:
+            self.log(f"Error fetching web profile for {username}: {e}")
+            # Still show the dialog, but with fallback text
+            self.ui_callback("show_profile", {
+                "id": avatar_id,
+                "about": f"Could not load profile. ({type(e).__name__})",
                 "born": "Unknown",
-                "url": f"https://my.secondlife.com/{username}",
+                "url": web_url,
+                "image_id": "",
                 "username": username,
                 "source": "error"
             })
@@ -3683,28 +3753,67 @@ class ThemedProfileDialog(Toplevel):
         uid_label = ttk.Label(f, text=f"ID: {self.data.get('id', 'Unknown')}", style='BlackGlass.TLabel', font=('Courier', 8), foreground='#888888')
         uid_label.pack(pady=(0, 15), anchor='w')
         
+        content_frame = ttk.Frame(f, style='BlackGlass.TFrame')
+        content_frame.pack(fill=tk.BOTH, expand=True)
+
+        left_frame = ttk.Frame(content_frame, style='BlackGlass.TFrame')
+        left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 15))
+
+        self.image_label = ttk.Label(left_frame, background='#1C1C1C', anchor='center')
+        self.image_label.pack(side=tk.TOP, pady=(0, 10))
+
+        image_id = self.data.get('image_id', '')
+        if image_id and image_id != "00000000-0000-0000-0000-000000000000":
+             self.image_label.configure(text="Loading Picture...")
+             threading.Thread(target=self._fetch_profile_image, args=(image_id,), daemon=True).start()
+        else:
+             self.image_label.configure(text="\nNo Picture\n")
+
+        right_frame = ttk.Frame(content_frame, style='BlackGlass.TFrame')
+        right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
         # Born On
-        ttk.Label(f, text="Born On:", style='BlackGlass.TLabel', font=('Helvetica', 10, 'bold')).pack(anchor='w')
-        ttk.Label(f, text=self.data.get('born', 'Unknown'), style='BlackGlass.TLabel').pack(pady=(0, 10), anchor='w', padx=5)
+        ttk.Label(right_frame, text="Born On:", style='BlackGlass.TLabel', font=('Helvetica', 10, 'bold')).pack(anchor='w')
+        ttk.Label(right_frame, text=self.data.get('born', 'Unknown'), style='BlackGlass.TLabel').pack(pady=(0, 10), anchor='w', padx=5)
         
         # About
-        ttk.Label(f, text="About/Bio:", style='BlackGlass.TLabel', font=('Helvetica', 10, 'bold')).pack(anchor='w')
+        ttk.Label(right_frame, text="About/Bio:", style='BlackGlass.TLabel', font=('Helvetica', 10, 'bold')).pack(anchor='w')
         about_text = self.data.get('about', '')
         if not about_text.strip():
             about_text = "(No bio provided)"
             
-        # Use a text box for About (read only)
-        txt = tk.Text(f, height=8, width=50, bg='#1E1E1E', fg='#CCCCCC', font=('Helvetica', 10),
-                      relief=tk.FLAT, highlightthickness=1, highlightbackground='#333333', wrap=tk.WORD)
+        # Use a text box for About (read only), with clickable hyperlinks
+        txt = tk.Text(right_frame, height=8, width=40, bg='#1E1E1E', fg='#CCCCCC', font=('Helvetica', 10),
+                      relief=tk.FLAT, highlightthickness=1, highlightbackground='#333333', wrap=tk.WORD,
+                      cursor='arrow')
+        txt.tag_config('hyperlink', foreground='#00FFFF', underline=True)
         txt.insert(tk.END, about_text)
+        
+        # Detect and tag all http(s) URLs so they become clickable
+        url_pattern = re.compile(r'https?://[^\s\]\[<>\"\']+', re.I)
+        for match in url_pattern.finditer(about_text):
+            start_char = match.start()
+            end_char = match.end()
+            # Convert character offsets to Tk "line.char" index notation
+            start_idx = f"1.0 + {start_char} chars"
+            end_idx   = f"1.0 + {end_char} chars"
+            tag_name = f"link_{start_char}"
+            link_url = match.group(0)
+            txt.tag_add(tag_name, start_idx, end_idx)
+            txt.tag_config(tag_name, foreground='#00FFFF', underline=True)
+            txt.tag_bind(tag_name, '<Button-1>', lambda e, u=link_url: os.startfile(u))
+            txt.tag_bind(tag_name, '<Enter>',   lambda e: txt.config(cursor='hand2'))
+            txt.tag_bind(tag_name, '<Leave>',   lambda e: txt.config(cursor='arrow'))
+        
         txt.config(state='disabled')
         txt.pack(pady=(0, 10), fill=tk.BOTH, expand=True)
+
         
         # URL
         url = self.data.get('url', '')
         if url:
-             ttk.Label(f, text="Web Profile:", style='BlackGlass.TLabel', font=('Helvetica', 10, 'bold')).pack(anchor='w')
-             link = ttk.Label(f, text=url, style='BlackGlass.TLabel', foreground='#00FFFF', cursor="hand2")
+             ttk.Label(right_frame, text="Web Profile:", style='BlackGlass.TLabel', font=('Helvetica', 10, 'bold')).pack(anchor='w')
+             link = ttk.Label(right_frame, text=url, style='BlackGlass.TLabel', foreground='#00FFFF', cursor="hand2")
              link.pack(anchor='w', padx=5)
              link.bind("<Button-1>", lambda e: os.startfile(url))
         
@@ -3721,6 +3830,43 @@ class ThemedProfileDialog(Toplevel):
         box = ttk.Frame(self, style='BlackGlass.TFrame')
         box.pack(padx=10, pady=(0, 10))
         ttk.Button(box, text="Close", width=12, command=self.on_close, style='BlackGlass.TButton').pack()
+
+    def _fetch_profile_image(self, image_id):
+        if not PIL_AVAILABLE:
+            self.image_label.after(0, lambda: self.image_label.configure(text="\nPIL missing\n"))
+            return
+        
+        # world.secondlife.com uses picture-service.secondlife.com for profile images
+        # Fall back to the old /app/image/ URL if needed
+        urls_to_try = [
+            f"https://picture-service.secondlife.com/{image_id}/256x192.jpg",
+            f"https://secondlife.com/app/image/{image_id}/1",
+        ]
+        
+        for url in urls_to_try:
+            try:
+                req = urllib.request.Request(url, headers={'User-Agent': SL_USER_AGENT})
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    if response.getcode() == 200:
+                        image_data = response.read()
+                        image = Image.open(BytesIO(image_data))
+                        resample = Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS
+                        image.thumbnail((180, 240), resample)
+                        photo = ImageTk.PhotoImage(image)
+                        self.image_label.after(0, lambda p=photo: self._apply_profile_image(p))
+                        self._profile_photo = photo
+                        return  # Success - stop trying
+            except Exception:
+                continue
+        
+        # All URLs failed
+        self.image_label.after(0, lambda: self.image_label.configure(text="\nNo Picture\n"))
+
+
+    def _apply_profile_image(self, photo):
+        # We check if the widget still exists before applying
+        if self.image_label.winfo_exists():
+            self.image_label.configure(image=photo, text="")
 
     def update_data(self, new_data):
         self.data.update(new_data)
@@ -4253,6 +4399,21 @@ class ChatTab(ttk.Frame):
         
         elif choice == "Profile":
             self._append_notification(f"[INFO] Fetching profile for {target_name}...")
+            
+            # Open a 'Loading...' dialog immediately so the user sees something right away
+            uid_key = target_uuid.lower()
+            loading_data = {
+                "id": target_uuid,
+                "name": target_name,
+                "about": "Loading profile...",
+                "born": "...",
+                "url": "",
+                "image_id": "",
+                "source": "loading"
+            }
+            self.update_ui("show_profile", loading_data)
+            
+            # Kick off the async profile fetch (will call update_ui('show_profile', ...) when done)
             self.sl_agent.request_avatar_properties(target_uuid)
 
     def _start_map_fetch_task(self, region_name):
@@ -4426,7 +4587,11 @@ class ChatTab(ttk.Frame):
         # 0. Sync back to the agent's central cache so the Nearby List sees it
         uid_lower = str(uid).lower()
         self.sl_agent.display_name_cache[uid_lower] = display_name
-        print(f"[DEBUG] update_display_name SET CACHE: {uid_lower} -> {display_name}")
+        # Use Python's sys.stdout write with safe encoding to avoid the `self.log` missing attribute and Windows console print crash
+        try:
+            print(f"[DEBUG] update_display_name SET CACHE: {uid_lower} -> {display_name}")
+        except UnicodeEncodeError:
+            print(f"[DEBUG] update_display_name SET CACHE: {uid_lower} -> {display_name.encode('ascii', 'replace').decode('ascii')}")
 
         # 1. Update the top bar label if it's the current agent
         if self.sl_agent.client and str(self.sl_agent.client.agent_id) == str(uid):
@@ -4929,8 +5094,6 @@ class MultiClientApp(tk.Tk):
     # --- Communication Handlers ---
     def handle_debug_log(self, message):
         """Central debug log handler."""
-        # Always print to console
-        print(f"[APPDEBUG] {message}")
         pass 
 
     def handle_agent_update(self, update_type, message):
