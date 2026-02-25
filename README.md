@@ -55,9 +55,9 @@ Interactive Sidebar: Real-time event notifications (teleport offers, lures) and 
 
 Consolidated Login: A dedicated "New Login" tab with saved profile management.
 
-<img width="795" height="675" alt="image" src="https://github.com/user-attachments/assets/5e4bb172-f206-4f56-b379-01e6d6fe45e4" />
+<img width="800" height="680" alt="image" src="https://github.com/user-attachments/assets/8c536038-741d-42d6-805f-c45d86eee1a7" />
 
-<img width="799" height="681" alt="image" src="https://github.com/user-attachments/assets/542cee6d-2ee1-465d-b455-3541077ab319" />
+<img width="800" height="680" alt="image" src="https://github.com/user-attachments/assets/ea9b6f1b-f170-4d8b-b691-267409ede1b4" />
 
 <img width="799" height="677" alt="image" src="https://github.com/user-attachments/assets/ba1c358c-ff1f-4cfc-abf5-3e439991a523" />
 
