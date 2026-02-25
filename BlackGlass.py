@@ -8,10 +8,8 @@ import socket
 import uuid as __uuid__
 import xmlrpc.client
 import hashlib
-import http.cookiejar
 import traceback
 import random
-import ssl
 from uuid import UUID, getnode as get_mac
 from tkinter import ttk 
 import json
@@ -26,7 +24,7 @@ from io import BytesIO
 
 # --- PIL/Pillow Import ---
 try:
-    from PIL import Image, ImageTk, ImageDraw
+    from PIL import Image, ImageTk
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
@@ -184,8 +182,6 @@ class quaternion:
         return struct.pack("<ffff", self.x, self.y, self.z, self.w)
     def __str__(self):
         return "<%f, %f, %f, %f>"%(self.x, self.y, self.z, self.w)
-
-rotation = quaternion
 
 
 
@@ -397,7 +393,7 @@ def packetErrorTrace(data):
     a = traceback.format_exc()
     if not a: return "Error: No error"
     try:
-        flags, seq, exlen = struct.unpack_from(">BIB", data, 0)
+        _, _, exlen = struct.unpack_from(">BIB", data, 0)
         mid = struct.unpack_from(">I", data, 6+exlen)[0]
         return "%s\nMID:%s\n%s"%(a, mid, ("-"*79)+"\n"+hexdump(data)+"\n"+("-"*79))
     except:
@@ -462,7 +458,7 @@ def login_to_simulator(firstname, lastname, password, mac=None, start="last", gr
         "last_exec_event": 0,
         "viewer_protocol_version": "1.0.0",
         "channel": "BlackGlass",
-        "version": "1.4.0",
+        "version": "1.3.0",
         "options": ["inventory-root", "buddy-list", "login-flags", "global-textures", "display-names"]
     })
     if result["login"] != "true":
@@ -1072,7 +1068,7 @@ class Packet:
                 try:
                     ackcount = data[len(data)-1]
                     ack_offset = len(data) - (ackcount * 4) - 1
-                    for i in range(ackcount):
+                    for _ in range(ackcount):
                         self.acks.append(struct.unpack_from(">I", data, ack_offset)[0])
                         ack_offset += 4
                 except: 
@@ -2142,59 +2138,6 @@ class SecondLifeAgent:
 
     # ... (rest of class) ...
 
-    # MODIFIED: Worker thread target for map image fetching - CLEANED
-    def _fetch_map_image_task(self, region_name):
-        try:
-            # Current grid coordinates
-            gx = self.client.grid_x
-            gy = self.client.grid_y
-            
-            # Use the proven URL format directly
-            url = f"https://map.secondlife.com/map-1-{gx}-{gy}-objects.jpg"
-            
-            # Proven headers
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/555.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/555.36'
-            }
-            
-            # Proven SSL Context
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            
-            request = urllib.request.Request(url, headers=headers)
-            
-            with urllib.request.urlopen(request, timeout=15, context=ctx) as response:
-                if response.getcode() == 200:
-                    map_data = response.read()
-                    
-                    if len(map_data) > 2000:
-                        self.ui_callback("map_image_fetched", map_data)
-                    else:
-#                         print(f"Map data too small: {len(map_data)}")
-                        pass
-                else:
-#                     print(f"Map HTTP Error: {response.getcode()}")
-                    pass
-
-        except Exception as e:
-            # Catch ANY crash in the thread
-            error_msg = f"{type(e).__name__}: {e}"
-#             print(f"MAP THREAD CRASH: {error_msg}")
-            self.ui_callback("status", f"⚠️ Map Error: {error_msg}")
-            self.ui_callback("map_image_fetched", None)
-            
-    def fetch_map(self, region_name):
-        """Public entry point for fetching the map image."""
-        if not PIL_AVAILABLE:
-            self.ui_callback("chat", "--- Map Debug: PIL NOT INSTALLED/DETECTED ---")
-            self.ui_callback("map_image_fetched", None) 
-            return
-        
-        if not self.running:
-            return
-            
-        threading.Thread(target=self._fetch_map_image_task, args=(region_name,), daemon=True).start()
 
     def _event_handler(self):
         """Runs in a separate thread to constantly check for new grid events."""
@@ -3057,7 +3000,7 @@ class SecondLifeAgent:
 
         last_error = ""
 
-        for i, map_url in enumerate(urls_to_try):
+        for map_url in urls_to_try:
             try:
                 request = urllib.request.Request(map_url, headers=headers)
                 
@@ -4401,7 +4344,6 @@ class ChatTab(ttk.Frame):
             self._append_notification(f"[INFO] Fetching profile for {target_name}...")
             
             # Open a 'Loading...' dialog immediately so the user sees something right away
-            uid_key = target_uuid.lower()
             loading_data = {
                 "id": target_uuid,
                 "name": target_name,
