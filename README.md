@@ -4,6 +4,7 @@
 
 Black Glass is a new chat viewer for Second Life, boasting a multi client login functionality.
 It allows for local chat and teleportation (both by double clicking the minimap as to another region).
+You can find a list of Nearby Avatars in which you can select each one for a "Teleport To" or "Profile" option.
 
 Download and run the .exe file on the right in Releases to help test and improve this project!
 ###
