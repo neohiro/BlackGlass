@@ -18,6 +18,7 @@ Black Glass is a lightweight, high-performance Second Life client focused on mul
 ## Updates
 
 1.4: URI namespaces are now resolved, groups, parcels and profiles are accessible in the viewer.
+
 1.3: You can find a list of Nearby Avatars in which you can select each one for a "Teleport To" or "Profile" option.
 
 ## 📨Advanced Chat & Communication
