@@ -2551,13 +2551,13 @@ class SecondLifeAgent:
             threading.Thread(target=self._fetch_avatar_properties_cap_task, args=(avatar_id,), daemon=True).start()
         
         # Priority 2: Web Fallback (Scraper)
+        # We start this immediately using the UUID; the username is only for the UI link.
         uid_key = str(avatar_id).lower()
         uname = self.username_cache.get(uid_key)
-        if uname:
-            threading.Thread(target=self._fetch_web_profile_task, args=(avatar_id, uname), daemon=True).start()
-        else:
-            self.pending_profile_fetches.add(uid_key)
-            # If we don't have the username yet, request names again for just this one
+        threading.Thread(target=self._fetch_web_profile_task, args=(avatar_id, uname), daemon=True).start()
+
+        # If we don't have the username/display name yet, request them too
+        if not uname or uid_key not in self.display_name_cache:
             threading.Thread(target=self.request_uuid_name, args=([avatar_id],), daemon=True).start()
 
     def _fetch_avatar_properties_cap_task(self, avatar_id):
@@ -3026,12 +3026,18 @@ class SecondLifeAgent:
         finally:
             self.fetching_parcels.discard(parcel_uuid)
 
-    def _fetch_web_profile_task(self, avatar_id, username):
+    def _fetch_web_profile_task(self, avatar_id, username=None):
         """Background task to fetch profile data from world.secondlife.com (no login required)."""
         # Use world.secondlife.com/resident/{UUID} - publicly accessible, no login needed.
         # my.secondlife.com requires login cookies and returns an empty login redirect page.
+        avatar_id = str(avatar_id).lower()
         public_url = f"https://world.secondlife.com/resident/{avatar_id}"
-        web_url = f"https://my.secondlife.com/{username}"
+        
+        # If we don't have a username, use the public URL as the web profile link too
+        if username:
+            web_url = f"https://my.secondlife.com/{username}"
+        else:
+            web_url = public_url
         
         try:
             self.log(f"[DEBUG] Fetching web profile for {username} ({avatar_id})...")
@@ -3107,7 +3113,7 @@ class SecondLifeAgent:
                 "born": born,
                 "url": web_url,  # Link to the user-facing profile page
                 "image_id": image_id,
-                "username": username,
+                "username": username or "",
                 "source": "web"
             })
             
@@ -5008,13 +5014,21 @@ class ChatTab(ttk.Frame):
         """Open the appropriate info popup for an agent, group, or parcel UUID."""
         uid = uid.lower()
         if entity_type == 'agent':
-            # Reuse the existing profile mechanism
             name = self.sl_agent.display_name_cache.get(uid, 'Unknown')
-            self.sl_agent.ui_callback('show_profile', {
-                'id': uid, 'name': name, 'about': '', 'born': '',
-                'url': '', 'username': self.sl_agent.username_cache.get(uid, ''),
-                'source': 'URI'
-            })
+            # Open a 'Loading...' dialog immediately so the user sees something right away
+            loading_data = {
+                "id": uid,
+                "name": name,
+                "about": "Loading profile...",
+                "born": "...",
+                "url": "",
+                "image_id": "",
+                "source": "loading"
+            }
+            self.update_ui("show_profile", loading_data)
+            
+            # Kick off the async profile fetch (will call update_ui('show_profile', ...) when done)
+            self.sl_agent.request_avatar_properties(uid)
         elif entity_type == 'group':
             data = self.sl_agent.group_data_cache.get(uid, {})
             if not data:
@@ -5039,6 +5053,17 @@ class ChatTab(ttk.Frame):
         # 0. Sync back to the agent's central cache so the Nearby List sees it
         uid_lower = str(uid).lower()
         self.sl_agent.display_name_cache[uid_lower] = display_name
+        
+        # Derive potential username for web profile link if missing
+        if uid_lower not in self.sl_agent.username_cache:
+            parts = display_name.lower().split()
+            if len(parts) >= 2 and parts[1] != 'resident':
+                # Modern account: first.last
+                self.sl_agent.username_cache[uid_lower] = f"{parts[0]}.{parts[1]}"
+            elif len(parts) >= 1:
+                # Legacy account: first
+                self.sl_agent.username_cache[uid_lower] = parts[0]
+
         # Use Python's sys.stdout write with safe encoding to avoid the `self.log` missing attribute and Windows console print crash
         try:
             print(f"[DEBUG] update_display_name SET CACHE: {uid_lower} -> {display_name}")
@@ -5049,7 +5074,6 @@ class ChatTab(ttk.Frame):
         if self.sl_agent.client and str(self.sl_agent.client.agent_id) == str(uid):
             full_name = f"{self.my_first_name} {self.my_last_name}"
             clean_full_name = full_name.replace(" Resident", "")
-            
             if display_name != full_name:
                 self.agent_name_label.config(text=f"Agent: {display_name} ({clean_full_name})")
             else:
@@ -5102,21 +5126,17 @@ class ChatTab(ttk.Frame):
 
         def lookup_name(uid_str, fallback=None):
             """
-            Return the cached display name, or a typed sentinel placeholder
-            '\x02R:agent:<uuid>\x03' that _append_chat will tag so the span can
-            be retroactively replaced AND made clickable when the name resolves.
+            Return a typed sentinel placeholder '\x02R:agent:<uuid>\x03'.
+            _insert_with_uri_tags will check the cache and either insert the 
+            name immediately as a link or show 'Resolving…'.
             """
             key = uid_str.lower()
             if self.sl_agent:
+                # Trigger fetch if not cached (non-blocking)
                 cached = self.sl_agent.display_name_cache.get(key)
-                if cached and cached not in ('Resolving\u2026', ''):
-                    return cached
-                # Kick off background fetch via get_display_name
-                fetched = self.sl_agent.get_display_name(uid_str, fallback or '')
-                if fetched and fetched not in ('', 'Resolving\u2026'):
-                    return fetched
-            # Return a typed sentinel so _insert_with_uri_tags can tag this span
-            return f'{_STX}R:agent:{uid_str.lower()}{_ETX}'
+                if not cached or cached in ('Resolving\u2026', ''):
+                    self.sl_agent.get_display_name(uid_str, fallback or '')
+            return f'{_STX}R:agent:{key}{_ETX}'
 
         def repl_agent_action(m):
             uid, action = m.group(1), m.group(2).rstrip('/')
@@ -5143,14 +5163,17 @@ class ChatTab(ttk.Frame):
             rf'secondlife:///app/agent/({UUID_RE})/([a-z]+)/?',
             repl_agent_action, text, flags=re.IGNORECASE)
 
+        # /app/agent/<uuid> (no action)
+        text = re.sub(
+            rf'secondlife:///app/agent/({UUID_RE})/?',
+            lambda m: lookup_name(m.group(1)), text, flags=re.IGNORECASE)
+
         def lookup_group_name(uid_str):
-            """Return the cached group name or a typed sentinel for retroactive resolution."""
+            """Return a typed sentinel for the group."""
             key = uid_str.lower()
             if self.sl_agent:
-                cached = self.sl_agent.group_name_cache.get(key)
-                if cached:
-                    return cached
-                self.sl_agent.get_group_name(key)
+                if not self.sl_agent.group_name_cache.get(key):
+                    self.sl_agent.get_group_name(key)
             return f'{_STX}R:group:{key}{_ETX}'
 
         # /app/group/<uuid>/about  and  /app/group/<uuid>/inspect
@@ -5162,6 +5185,11 @@ class ChatTab(ttk.Frame):
         text = re.sub(
             rf'secondlife:///app/group/({UUID_RE})/([a-z]+)/?',
             repl_group_action, text, flags=re.IGNORECASE)
+
+        # /app/group/<uuid> (no action)
+        text = re.sub(
+            rf'secondlife:///app/group/({UUID_RE})/?',
+            lambda m: lookup_group_name(m.group(1)), text, flags=re.IGNORECASE)
 
         # /app/group/create
         text = re.sub(
@@ -5222,13 +5250,11 @@ class ChatTab(ttk.Frame):
 
         # /app/parcel/<uuid>/about  — parcel UUID, resolvable via world.secondlife.com/place/<uuid>
         def lookup_parcel_name(uid_str):
-            """Return cached parcel name or a typed sentinel for retroactive resolution."""
+            """Return typed sentinel for the parcel."""
             key = uid_str.lower()
             if self.sl_agent:
-                cached = self.sl_agent.parcel_name_cache.get(key)
-                if cached:
-                    return cached
-                self.sl_agent.get_parcel_name(key)
+                if not self.sl_agent.parcel_name_cache.get(key):
+                    self.sl_agent.get_parcel_name(key)
             return f'{_STX}R:parcel:{key}{_ETX}'
 
         def repl_parcel_action(m):
@@ -5236,8 +5262,13 @@ class ChatTab(ttk.Frame):
             pname = lookup_parcel_name(uid)
             return f'[Parcel: {pname}]'
         text = re.sub(
-            rf'secondlife:///app/parcel/({UUID_RE})/about/?',
+            rf'secondlife:///app/parcel/({UUID_RE})/(?:about|inspect|about)/?',
             repl_parcel_action, text, flags=re.IGNORECASE)
+
+        # /app/parcel/<uuid> (no action)
+        text = re.sub(
+            rf'secondlife:///app/parcel/({UUID_RE})/?',
+            lambda m: lookup_parcel_name(m.group(1).lower()), text, flags=re.IGNORECASE)
 
         # /app/search/<category>/<term>
         def repl_search(m):
@@ -5431,11 +5462,34 @@ class ChatTab(ttk.Frame):
                 entity_type = parts[i]      # 'agent' | 'group' | 'parcel'
                 entity_uuid = parts[i + 1]  # the UUID
                 tag = f'sluri_{entity_type}_{entity_uuid}'
-                # Grey italic while unresolved
-                self.chat_display.tag_config(
-                    tag, foreground='#888888', font=('Courier', 10, 'italic'))
-                display_tags = (tag,) + base_tags
-                self.chat_display.insert(tk.END, 'Resolving\u2026', display_tags)
+                
+                # Check cache for immediate resolution
+                cached_name = None
+                if entity_type == 'agent':
+                    cached_name = self.sl_agent.display_name_cache.get(entity_uuid.lower())
+                elif entity_type == 'group':
+                    cached_name = self.sl_agent.group_name_cache.get(entity_uuid.lower())
+                elif entity_type == 'parcel':
+                    cached_name = self.sl_agent.parcel_name_cache.get(entity_uuid.lower())
+                
+                if cached_name and cached_name not in ('Resolving\u2026', ''):
+                    # Style as cyan link immediately
+                    self.chat_display.tag_config(tag, foreground='#00BFFF', underline=True,
+                                                  font=('Courier', 12))
+                    self.chat_display.tag_bind(tag, '<Button-1>',
+                        lambda e, t=entity_type, u=entity_uuid: self._open_sl_entity_popup(t, u))
+                    self.chat_display.tag_bind(tag, '<Enter>',
+                        lambda e: self.chat_display.config(cursor='hand2'))
+                    self.chat_display.tag_bind(tag, '<Leave>',
+                        lambda e: self.chat_display.config(cursor=''))
+                    
+                    self.chat_display.insert(tk.END, cached_name, (tag,) + base_tags)
+                else:
+                    # Grey italic while unresolved
+                    self.chat_display.tag_config(
+                        tag, foreground='#888888', font=('Courier', 10, 'italic'))
+                    display_tags = (tag,) + base_tags
+                    self.chat_display.insert(tk.END, 'Resolving\u2026', display_tags)
                 i += 2
 
     def _append_chat(self, message, name=None):
