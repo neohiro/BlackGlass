@@ -1667,7 +1667,7 @@ class RegionClient:
                     
                     if uid and first:
                         uid_str = str(uid)
-                        full_name = f"{first} {last}".strip()
+                        full_name = f"{first} {last}".replace(" Resident", "").strip()
                         
                         # Cache the name for general use
                         # Add a hook to UI callback if necessary (using the same event)
@@ -2061,6 +2061,16 @@ class SecondLifeAgent:
         self.username_cache = {}     # UUID -> Username (e.g. 'sarahlionheart')
         self.fetching_names = set() # Set of UUIDs currently being fetched
         self.pending_profile_fetches = set() # UUIDs waiting for usernames to fetch web profiles
+
+        # Group Name Caching
+        self.group_name_cache = {}   # UUID -> group name string
+        self.group_data_cache = {}   # UUID -> full group data dict
+        self.fetching_groups = set() # group UUIDs currently being fetched
+
+        # Parcel Name Caching
+        self.parcel_name_cache = {}   # UUID -> parcel name string
+        self.parcel_data_cache = {}  # UUID -> full parcel data dict
+        self.fetching_parcels = set() # parcel UUIDs currently being fetched
         
         # Connection credentials
         self.agent_id = None
@@ -2845,6 +2855,176 @@ class SecondLifeAgent:
             for uid in uuids:
                 if uid in self.fetching_names:
                     self.fetching_names.remove(uid)
+
+    def get_group_name(self, group_id):
+        """
+        Return the cached group name for *group_id*, or kick off a background
+        web-scrape fetch and return None so the caller can emit a sentinel.
+        """
+        key = str(group_id).lower()
+        cached = self.group_name_cache.get(key)
+        if cached:
+            return cached
+        if key not in self.fetching_groups:
+            self.fetching_groups.add(key)
+            threading.Thread(
+                target=self._fetch_group_name_task,
+                args=(key,), daemon=True).start()
+        return None
+
+    def _fetch_group_name_task(self, group_uuid):
+        """
+        Scrape https://world.secondlife.com/group/<uuid> for the group name.
+        The <title> tag contains the group name directly (e.g. "Second Life Birthday").
+        Fires ui_callback('update_group_name', (uuid, name)) on success so the
+        UI can retroactively patch Resolving… spans in old chat messages.
+        """
+        url = f'https://world.secondlife.com/group/{group_uuid}'
+        try:
+            self.log(f'Fetching group name from: {url}')
+            req = urllib.request.Request(
+                url,
+                headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                                  'AppleWebKit/537.36 (KHTML, like Gecko) '
+                                  'Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'text/html'
+                }
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.getcode() == 200:
+                    html = resp.read().decode('utf-8', errors='replace')
+                    # The <title> tag holds the group name on this page
+                    title_m = re.search(r'<title[^>]*>([^<]+)</title>', html, re.IGNORECASE)
+                    if title_m:
+                        name = html_parser.unescape(title_m.group(1).strip())
+                        # Strip any " | Second Life" or " - Second Life" suffix
+                        for suffix in (' | Second Life', ' - Second Life'):
+                            if name.endswith(suffix):
+                                name = name[:-len(suffix)].strip()
+                                break
+                    else:
+                        # Fallback: <meta name="description" content="..."> first line
+                        desc_m = re.search(
+                            r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)',
+                            html, re.IGNORECASE)
+                        name = html_parser.unescape(
+                            desc_m.group(1).split('\n')[0].strip()) if desc_m else ''
+                    if name:
+                        self.group_name_cache[group_uuid] = name
+                        # Robust meta-tag parser: iterate each <meta> tag, check attrs separately
+                        def _meta(attr_name, _html=html):
+                            for _tag in re.findall(r'<meta\b[^>]*>', _html, re.IGNORECASE):
+                                _nm = re.search(r'\bname=["\']([^"\']+)["\']', _tag, re.IGNORECASE)
+                                _ct = re.search(r'\bcontent=["\']([^"\']*)["\']', _tag, re.IGNORECASE)
+                                if _nm and _nm.group(1).strip().lower() == attr_name.lower() and _ct:
+                                    return html_parser.unescape(_ct.group(1).strip())
+                            return ''
+                        data = {
+                            'name': name,
+                            'description': _meta('description'),
+                            'member_count': _meta('member_count'),
+                            'open_enrollment': _meta('open_enrollment'),
+                            'membership_fee': _meta('membership_fee'),
+                            'founder': _meta('founder'),
+                            'founder_id': _meta('founderid'),
+                            'image_id': _meta('imageid'),
+                            'id': group_uuid,
+                        }
+                        self.group_data_cache[group_uuid] = data
+                        self.ui_callback('update_group_name', (group_uuid, data))
+                    else:
+                        self.log(f'Could not parse group name from {url}')
+        except Exception as e:
+            err = str(e).encode('ascii', errors='replace').decode('ascii')
+            self.log(f'Error fetching group name: {err}')
+        finally:
+            self.fetching_groups.discard(group_uuid)
+
+    def get_parcel_name(self, parcel_id):
+        """
+        Return the cached parcel name for *parcel_id* (a UUID string), or kick
+        off a background web-scrape fetch and return None for a sentinel.
+        """
+        key = str(parcel_id).lower()
+        cached = self.parcel_name_cache.get(key)
+        if cached:
+            return cached
+        if key not in self.fetching_parcels:
+            self.fetching_parcels.add(key)
+            threading.Thread(
+                target=self._fetch_parcel_name_task,
+                args=(key,), daemon=True).start()
+        return None
+
+    def _fetch_parcel_name_task(self, parcel_uuid):
+        """
+        Scrape https://world.secondlife.com/place/<uuid> for the parcel name.
+        The page title has the form  "Parcel Name | Second Life"  or just the
+        parcel name — we strip the " | Second Life" suffix if present.
+        Fires ui_callback('update_parcel_name', (uuid, name)) on success.
+        """
+        url = f'https://world.secondlife.com/place/{parcel_uuid}'
+        try:
+            self.log(f'Fetching parcel name from: {url}')
+            req = urllib.request.Request(
+                url,
+                headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                                  'AppleWebKit/537.36 (KHTML, like Gecko) '
+                                  'Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'text/html'
+                }
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.getcode() == 200:
+                    html = resp.read().decode('utf-8', errors='replace')
+                    # Try <title> tag first
+                    title_m = re.search(r'<title[^>]*>([^<]+)</title>', html, re.IGNORECASE)
+                    if title_m:
+                        title = html_parser.unescape(title_m.group(1).strip())
+                        # Strip common suffixes added by world.secondlife.com
+                        for suffix in (' | Second Life', ' - Second Life'):
+                            if title.endswith(suffix):
+                                title = title[:-len(suffix)].strip()
+                                break
+                        name = title
+                    else:
+                        # Fallback: look for og:title
+                        og_m = re.search(
+                            r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)',
+                            html, re.IGNORECASE)
+                        name = html_parser.unescape(og_m.group(1).strip()) if og_m else ''
+                    if name:
+                        self.parcel_name_cache[parcel_uuid] = name
+                        # Parse rich meta data
+                        # Robust meta-tag parser: iterate each <meta> tag, check attrs separately
+                        def _pmeta(attr_name, _html=html):
+                            for _tag in re.findall(r'<meta\b[^>]*>', _html, re.IGNORECASE):
+                                _nm = re.search(r'\bname=["\']([^"\']+)["\']', _tag, re.IGNORECASE)
+                                _ct = re.search(r'\bcontent=["\']([^"\']*)["\']', _tag, re.IGNORECASE)
+                                if _nm and _nm.group(1).strip().lower() == attr_name.lower() and _ct:
+                                    return html_parser.unescape(_ct.group(1).strip())
+                            return ''
+                        data = {
+                            'name': name,
+                            'description': _pmeta('description'),
+                            'region': _pmeta('region'),
+                            'location': _pmeta('location'),
+                            'snapshot': _pmeta('snapshot'),
+                            'image_id': _pmeta('imageid'),
+                            'mat': _pmeta('mat'),
+                            'id': parcel_uuid,
+                        }
+                        self.parcel_data_cache[parcel_uuid] = data
+                        self.ui_callback('update_parcel_name', (parcel_uuid, data))
+                    else:
+                        self.log(f'Could not parse parcel name from {url}')
+        except Exception as e:
+            err = str(e).encode('ascii', errors='replace').decode('ascii')
+            self.log(f'Error fetching parcel name: {err}')
+        finally:
+            self.fetching_parcels.discard(parcel_uuid)
 
     def _fetch_web_profile_task(self, avatar_id, username):
         """Background task to fetch profile data from world.secondlife.com (no login required)."""
@@ -3644,10 +3824,284 @@ class ThemedChoiceDialog(ThemedDialog):
         d = ThemedChoiceDialog(parent, title, prompt, choices, topmost)
         return d.result
 
+class ThemedGroupDialog(Toplevel):
+    """Displays Second Life group information scraped from world.secondlife.com/group/<uuid>."""
+
+    def __init__(self, parent, data, chat_tab, uid_key):
+        super().__init__(parent)
+        self.data = data
+        self.chat_tab = chat_tab
+        self.uid_key = uid_key
+        self.transient(parent)
+        self.title(f"Group: {data.get('name', 'Unknown')}")
+        self.configure(bg='#0A0A0A')
+        self.resizable(False, False)
+        self.protocol('WM_DELETE_WINDOW', self.on_close)
+        self._setup_ui()
+        self.update_idletasks()
+        w, h = self.winfo_width(), self.winfo_height()
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        self.geometry(f'+{px+(pw-w)//2}+{py+(ph-h)//2}')
+        self.focus_set()
+
+    def _setup_ui(self):
+        for c in self.winfo_children(): c.destroy()
+        d = self.data
+        pad = {'padx': 20, 'pady': 20}
+        f = ttk.Frame(self, style='BlackGlass.TFrame')
+        f.pack(fill=tk.BOTH, expand=True, **pad)
+
+        # ── Header ──────────────────────────────────────────────────
+        ttk.Label(f, text=d.get('name', 'Unknown Group'),
+                  style='BlackGlass.TLabel',
+                  font=('Helvetica', 14, 'bold')).pack(anchor='w')
+        ttk.Label(f, text=f"ID: {d.get('id', '')}",
+                  style='BlackGlass.TLabel',
+                  font=('Courier', 8), foreground='#888888').pack(anchor='w', pady=(0, 10))
+
+        # ── Content row: image left, details right ───────────────────
+        row = ttk.Frame(f, style='BlackGlass.TFrame')
+        row.pack(fill=tk.BOTH, expand=True)
+
+        # Group image
+        self._img_label = ttk.Label(row, background='#1C1C1C',
+                                    text='\nNo Image\n', anchor='center', width=16)
+        self._img_label.pack(side=tk.LEFT, padx=(0, 15), anchor='n')
+        image_id = d.get('image_id', '')
+        if image_id and image_id != '00000000-0000-0000-0000-000000000000':
+            self._img_label.configure(text='Loading…')
+            threading.Thread(target=self._fetch_image, args=(image_id,), daemon=True).start()
+
+        # Details column
+        right = ttk.Frame(row, style='BlackGlass.TFrame')
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        def lbl(parent, label, value, fg=None):
+            ttk.Label(parent, text=label, style='BlackGlass.TLabel',
+                      font=('Helvetica', 10, 'bold')).pack(anchor='w')
+            kw = {'style': 'BlackGlass.TLabel', 'anchor': 'w', 'padx': 5}
+            if fg: kw['foreground'] = fg
+            ttk.Label(parent, text=value or '—', **kw).pack(anchor='w', pady=(0, 6))
+
+        # Group Description (About / Charter)
+        desc = d.get('description', '').strip()
+        if desc:
+            ttk.Label(right, text='Group Information:', style='BlackGlass.TLabel',
+                      font=('Helvetica', 10, 'bold')).pack(anchor='w')
+            txt = tk.Text(right, height=12, width=42,
+                          bg='#1E1E1E', fg='#CCCCCC', font=('Helvetica', 10),
+                          relief=tk.FLAT, highlightthickness=1,
+                          highlightbackground='#333333', wrap=tk.WORD, cursor='arrow')
+            txt.tag_config('hyperlink', foreground='#00BFFF', underline=True)
+            txt.insert(tk.END, desc)
+            
+            # Detect and tag URLs in the group description
+            url_pattern = re.compile(r'https?://[^\s\]\[<>\"\']+', re.I)
+            for match in url_pattern.finditer(desc):
+                start_i = f"1.0 + {match.start()} chars"
+                end_i = f"1.0 + {match.end()} chars"
+                link_tag = f"link_{match.start()}"
+                url = match.group(0)
+                txt.tag_add(link_tag, start_i, end_i)
+                txt.tag_config(link_tag, foreground='#00BFFF', underline=True)
+                txt.tag_bind(link_tag, '<Button-1>', lambda e, u=url: __import__('webbrowser').open(u))
+                txt.tag_bind(link_tag, '<Enter>', lambda e: txt.config(cursor='hand2'))
+                txt.tag_bind(link_tag, '<Leave>', lambda e: txt.config(cursor='arrow'))
+
+            txt.config(state='disabled')
+            txt.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        else:
+            ttk.Label(right, text='No group information provided.', 
+                      style='BlackGlass.TLabel', font=('Helvetica', 10, 'italic')).pack(anchor='w')
+
+        # Web link
+        uid = d.get('id', '')
+        web_url = f'https://world.secondlife.com/group/{uid}' if uid else ''
+        if web_url:
+            link = ttk.Label(f, text=web_url, style='BlackGlass.TLabel',
+                             foreground='#00BFFF', cursor='hand2')
+            link.pack(anchor='w', pady=(4, 0))
+            link.bind('<Button-1>', lambda e, u=web_url: __import__('webbrowser').open(u))
+
+        ttk.Button(self, text='Close', width=12, command=self.on_close,
+                   style='BlackGlass.TButton').pack(pady=(0, 10))
+
+    def _fetch_image(self, image_id):
+        if not PIL_AVAILABLE:
+            self._img_label.after(0, lambda: self._img_label.configure(text='\nPIL missing\n'))
+            return
+        url = f'https://picture-service.secondlife.com/{image_id}/256x192.jpg'
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': SL_USER_AGENT})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                if r.getcode() == 200:
+                    img = Image.open(BytesIO(r.read()))
+                    img.thumbnail((128, 128), Image.Resampling.LANCZOS
+                                  if hasattr(Image, 'Resampling') else Image.LANCZOS)
+                    photo = ImageTk.PhotoImage(img)
+                    self._photo = photo
+                    self._img_label.after(0, lambda p=photo:
+                        self._img_label.configure(image=p, text=''))
+        except Exception:
+            self._img_label.after(0, lambda: self._img_label.configure(text='\nNo Image\n'))
+
+    def on_close(self):
+        self.chat_tab.active_profiles.pop(self.uid_key, None)
+        self.destroy()
+
+
+class ThemedParcelDialog(Toplevel):
+    """Displays Second Life parcel information scraped from world.secondlife.com/place/<uuid>."""
+
+    def __init__(self, parent, data, chat_tab, uid_key):
+        super().__init__(parent)
+        self.data = data
+        self.chat_tab = chat_tab
+        self.uid_key = uid_key
+        self.transient(parent)
+        self.title(f"Parcel: {data.get('name', 'Unknown')}")
+        self.configure(bg='#0A0A0A')
+        self.resizable(False, False)
+        self.protocol('WM_DELETE_WINDOW', self.on_close)
+        self._setup_ui()
+        self.update_idletasks()
+        w, h = self.winfo_width(), self.winfo_height()
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        self.geometry(f'+{px+(pw-w)//2}+{py+(ph-h)//2}')
+        self.focus_set()
+
+    def _setup_ui(self):
+        for c in self.winfo_children(): c.destroy()
+        d = self.data
+        f = ttk.Frame(self, style='BlackGlass.TFrame')
+        f.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+
+        # ── Header ──────────────────────────────────────────────────
+        ttk.Label(f, text=d.get('name', 'Unknown Parcel'),
+                  style='BlackGlass.TLabel',
+                  font=('Helvetica', 14, 'bold')).pack(anchor='w')
+        ttk.Label(f, text=f"ID: {d.get('id', '')}",
+                  style='BlackGlass.TLabel',
+                  font=('Courier', 8), foreground='#888888').pack(anchor='w', pady=(0, 10))
+
+        # ── Content row: snapshot left, details right ────────────────
+        row = ttk.Frame(f, style='BlackGlass.TFrame')
+        row.pack(fill=tk.BOTH, expand=True)
+
+        self._img_label = ttk.Label(row, background='#1C1C1C',
+                                    text='\nNo Image\n', anchor='center', width=16)
+        self._img_label.pack(side=tk.LEFT, padx=(0, 15), anchor='n')
+
+        # Try snapshot URL first, then imageid
+        snap_url = d.get('snapshot', '')
+        image_id = d.get('image_id', '')
+        if snap_url:
+            self._img_label.configure(text='Loading…')
+            threading.Thread(target=self._fetch_url_image, args=(snap_url,), daemon=True).start()
+        elif image_id and image_id != '00000000-0000-0000-0000-000000000000':
+            self._img_label.configure(text='Loading…')
+            pic_url = f'https://picture-service.secondlife.com/{image_id}/256x192.jpg'
+            threading.Thread(target=self._fetch_url_image, args=(pic_url,), daemon=True).start()
+
+        # Details column
+        right = ttk.Frame(row, style='BlackGlass.TFrame')
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        def lbl(label, value, fg=None):
+            if not value: return
+            ttk.Label(right, text=label, style='BlackGlass.TLabel',
+                      font=('Helvetica', 10, 'bold')).pack(anchor='w')
+            kw = {'style': 'BlackGlass.TLabel', 'anchor': 'w', 'padx': 5}
+            if fg: kw['foreground'] = fg
+            ttk.Label(right, text=value, **kw).pack(anchor='w', pady=(0, 6))
+
+        region   = d.get('region', '')
+        location = d.get('location', '')
+        mat      = d.get('mat', '')
+        lbl('Region:', region)
+        lbl('Location:', location)
+        if mat:
+            mat_labels = {'PG': 'General', 'M_AO': 'Moderate', 'A_AO': 'Adult'}
+            lbl('Maturity:', mat_labels.get(mat.upper(), mat))
+
+        desc = d.get('description', '').strip()
+        if desc:
+            ttk.Label(right, text='Description:', style='BlackGlass.TLabel',
+                      font=('Helvetica', 10, 'bold')).pack(anchor='w')
+            txt = tk.Text(right, height=6, width=42,
+                          bg='#1E1E1E', fg='#CCCCCC', font=('Helvetica', 10),
+                          relief=tk.FLAT, highlightthickness=1,
+                          highlightbackground='#333333', wrap=tk.WORD, cursor='arrow')
+            txt.insert(tk.END, desc)
+            txt.config(state='disabled')
+            txt.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        uid = d.get('id', '')
+        web_url = f'https://world.secondlife.com/place/{uid}' if uid else ''
+        if web_url:
+            link = ttk.Label(f, text=web_url, style='BlackGlass.TLabel',
+                             foreground='#00BFFF', cursor='hand2')
+            link.pack(anchor='w', pady=(4, 0))
+            link.bind('<Button-1>', lambda e, u=web_url: __import__('webbrowser').open(u))
+
+        # ── Button row ───────────────────────────────────────────────
+        btn_row = ttk.Frame(self, style='BlackGlass.TFrame')
+        btn_row.pack(pady=(0, 10))
+
+        region = d.get('region', '')
+        location = d.get('location', '')   # "X/Y/Z"
+
+        def _do_teleport(r=region, loc=location):
+            if not r:
+                return
+            try:
+                parts = [int(v) for v in loc.split('/')]
+                x, y, z = parts[0], parts[1], parts[2] + 1  # +1 to avoid floor clip
+            except Exception:
+                x, y, z = 128, 128, 30
+            self.chat_tab.sl_agent.hard_teleport(r, x, y, z)
+            self.on_close()
+
+        tp_btn = ttk.Button(btn_row, text='Teleport To', width=14,
+                            command=_do_teleport, style='BlackGlass.TButton')
+        tp_btn.pack(side=tk.LEFT, padx=(0, 8))
+        if not region:
+            tp_btn.config(state='disabled')
+
+        ttk.Button(btn_row, text='Close', width=12, command=self.on_close,
+                   style='BlackGlass.TButton').pack(side=tk.LEFT)
+
+
+    def _fetch_url_image(self, url):
+        if not PIL_AVAILABLE:
+            self._img_label.after(0, lambda: self._img_label.configure(text='\nPIL missing\n'))
+            return
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': SL_USER_AGENT})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                if r.getcode() == 200:
+                    img = Image.open(BytesIO(r.read()))
+                    img.thumbnail((128, 128), Image.Resampling.LANCZOS
+                                  if hasattr(Image, 'Resampling') else Image.LANCZOS)
+                    photo = ImageTk.PhotoImage(img)
+                    self._photo = photo
+                    self._img_label.after(0, lambda p=photo:
+                        self._img_label.configure(image=p, text=''))
+        except Exception:
+            self._img_label.after(0, lambda: self._img_label.configure(text='\nNo Image\n'))
+
+    def on_close(self):
+        self.chat_tab.active_profiles.pop(self.uid_key, None)
+        self.destroy()
+
+
 class ThemedProfileDialog(Toplevel):
     """
     Displays avatar profile information. 
     Modified to be non-blocking and support dynamic updates from web scraping.
+
     """
     def __init__(self, parent, profile_data, chat_tab, uid_key):
         super().__init__(parent)
@@ -4143,7 +4597,8 @@ class ChatTab(ttk.Frame):
         control_frame = ttk.Frame(self, style='BlackGlass.TFrame')
         control_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(10, 5))
         
-        self.agent_name_label = ttk.Label(control_frame, text=f"Agent: {self.my_first_name} {self.my_last_name}", style='BlackGlass.TLabel', font=('Helvetica', 12, 'bold'))
+        clean_name = f"{self.my_first_name} {self.my_last_name}".replace(" Resident", "")
+        self.agent_name_label = ttk.Label(control_frame, text=f"Agent: {clean_name}", style='BlackGlass.TLabel', font=('Helvetica', 12, 'bold'))
         self.agent_name_label.pack(side=tk.LEFT, padx=5)
         
         teleport_button = ttk.Button(control_frame, text="Teleport...", command=self.do_teleport, style='BlackGlass.TButton')
@@ -4169,8 +4624,12 @@ class ChatTab(ttk.Frame):
         self.chat_display.grid(row=0, column=0, sticky='nsew', padx=(0, 0))
         
         # --- FIX: Configure tag for gray speaker name ---
-        self.chat_display.tag_config('speaker_name', foreground='#AAAAAA') 
+        self.chat_display.tag_config('speaker_name', foreground='#AAAAAA')
         # ------------------------------------------------
+
+        # --- Hyperlink base tag (style only; bindings go on per-link tags) ---
+        self.chat_display.tag_config('hyperlink', foreground='#00BFFF', underline=True)
+        self._link_counter = 0   # unique index for per-link tags
 
         # 2. Right Panel Frame (Column 1, Row 0 - Contains Notifications and Minimap)
         right_panel_frame = ttk.Frame(main_content_frame, style='BlackGlass.TFrame')
@@ -4457,14 +4916,15 @@ class ChatTab(ttk.Frame):
                 # Fetch self display name
                 agent_id = self.sl_agent.client.agent_id if self.sl_agent.client else None
                 from_name = f"{self.my_first_name} {self.my_last_name}"
+                clean_from_name = from_name.replace(" Resident", "")
                 display_name = self.sl_agent.get_display_name(agent_id, from_name)
                 
                 # FIX: Avoid printing the same name twice
                 if display_name and display_name != from_name:
-                    name_label = f"{display_name} ({from_name})"
+                    name_label = f"{display_name} ({clean_from_name})"
                     self.after(0, self.agent_name_label.config, {'text': f"Agent: {name_label}"})
                 else:
-                    name_label = from_name
+                    name_label = clean_from_name
                     
                 self.after(0, self._append_chat, confirmed_msg, name_label)
         elif update_type == "status":
@@ -4519,10 +4979,60 @@ class ChatTab(ttk.Frame):
             # Handle asynchronous display name update
             uid, dname = message
             self.after(0, lambda: self.update_display_name(uid, dname))
+
+        elif update_type == "update_group_name":
+            uid, data = message
+            gname = data['name'] if isinstance(data, dict) else data
+            def _patch_group(u=uid, n=gname, d=data):
+                self.sl_agent.group_name_cache[u] = n
+                if isinstance(d, dict):
+                    self.sl_agent.group_data_cache[u] = d
+                self._replace_resolving_spans(f'sluri_group_{u}', n)
+            self.after(0, _patch_group)
+
+        elif update_type == "update_parcel_name":
+            uid, data = message
+            pname = data['name'] if isinstance(data, dict) else data
+            def _patch_parcel(u=uid, n=pname, d=data):
+                self.sl_agent.parcel_name_cache[u] = n
+                if isinstance(d, dict):
+                    self.sl_agent.parcel_data_cache[u] = d
+                self._replace_resolving_spans(f'sluri_parcel_{u}', n)
+            self.after(0, _patch_parcel)
             
         elif update_type == "clear_map":
             # Clear the minimap image (e.g. on logout/teleport start)
             self.after(0, lambda: self.minimap.update_map_image(None))
+
+    def _open_sl_entity_popup(self, entity_type, uid):
+        """Open the appropriate info popup for an agent, group, or parcel UUID."""
+        uid = uid.lower()
+        if entity_type == 'agent':
+            # Reuse the existing profile mechanism
+            name = self.sl_agent.display_name_cache.get(uid, 'Unknown')
+            self.sl_agent.ui_callback('show_profile', {
+                'id': uid, 'name': name, 'about': '', 'born': '',
+                'url': '', 'username': self.sl_agent.username_cache.get(uid, ''),
+                'source': 'URI'
+            })
+        elif entity_type == 'group':
+            data = self.sl_agent.group_data_cache.get(uid, {})
+            if not data:
+                data = {'name': self.sl_agent.group_name_cache.get(uid, uid), 'id': uid}
+            key = f'group_{uid}'
+            if key in self.active_profiles and self.active_profiles[key].winfo_exists():
+                self.active_profiles[key].lift()
+            else:
+                self.active_profiles[key] = ThemedGroupDialog(self.master, data, self, key)
+        elif entity_type == 'parcel':
+            data = self.sl_agent.parcel_data_cache.get(uid, {})
+            if not data:
+                data = {'name': self.sl_agent.parcel_name_cache.get(uid, uid), 'id': uid}
+            key = f'parcel_{uid}'
+            if key in self.active_profiles and self.active_profiles[key].winfo_exists():
+                self.active_profiles[key].lift()
+            else:
+                self.active_profiles[key] = ThemedParcelDialog(self.master, data, self, key)
 
     def update_display_name(self, uid, display_name):
         """Updates the UI when a display name is resolved."""
@@ -4545,18 +5055,402 @@ class ChatTab(ttk.Frame):
             else:
                 self.agent_name_label.config(text=f"Agent: {clean_full_name}")
                 
-        # 2. (Future) Retroactive chat log updates could be implemented here if messages were tagged.
+        # 2. Retroactively replace any 'Resolving…' spans tagged with this UUID
+        self._replace_resolving_spans(f'sluri_agent_{uid_lower}', display_name)
 
+    def _replace_resolving_spans(self, tag, display_name):
+        """
+        Find every 'Resolving\u2026' span in chat_display tagged with *tag*
+        and replace it in-place with display_name, then style it as a link.
+        """
+        widget = self.chat_display
+        ranges = widget.tag_ranges(tag)
+        if not ranges:
+            return
+        widget.config(state='normal')
+        # Parse entity type + uuid from tag name: sluri_<type>_<uuid>
+        parts = tag.split('_', 2)  # ['sluri', type, uuid]
+        entity_type = parts[1] if len(parts) >= 3 else 'agent'
+        entity_uuid = parts[2] if len(parts) >= 3 else parts[-1]
+        # Style as cyan underlined clickable link
+        widget.tag_config(tag, foreground='#00BFFF', underline=True,
+                          font=('Courier', 12))
+        widget.tag_bind(tag, '<Button-1>',
+            lambda e, t=entity_type, u=entity_uuid: self._open_sl_entity_popup(t, u))
+        widget.tag_bind(tag, '<Enter>',
+            lambda e: widget.config(cursor='hand2'))
+        widget.tag_bind(tag, '<Leave>',
+            lambda e: widget.config(cursor=''))
+        # Process pairs (start, end) in REVERSE order so earlier indices stay valid
+        pairs = list(zip(ranges[::2], ranges[1::2]))
+        for start, end in reversed(pairs):
+            widget.delete(start, end)
+            widget.insert(start, display_name, (tag,))
+        widget.config(state='disabled')
+
+
+    def _resolve_sl_uris(self, text):
+        """
+        Resolve all known secondlife:// and secondlife:///app/ URI namespaces
+        into human-readable text, based on:
+        https://wiki.secondlife.com/wiki/Viewer_URI_Name_Space
+        """
+        UUID_RE = r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+
+        # Sentinel characters that cannot appear in SL chat
+        _STX, _ETX = '\x02', '\x03'
+
+        def lookup_name(uid_str, fallback=None):
+            """
+            Return the cached display name, or a typed sentinel placeholder
+            '\x02R:agent:<uuid>\x03' that _append_chat will tag so the span can
+            be retroactively replaced AND made clickable when the name resolves.
+            """
+            key = uid_str.lower()
+            if self.sl_agent:
+                cached = self.sl_agent.display_name_cache.get(key)
+                if cached and cached not in ('Resolving\u2026', ''):
+                    return cached
+                # Kick off background fetch via get_display_name
+                fetched = self.sl_agent.get_display_name(uid_str, fallback or '')
+                if fetched and fetched not in ('', 'Resolving\u2026'):
+                    return fetched
+            # Return a typed sentinel so _insert_with_uri_tags can tag this span
+            return f'{_STX}R:agent:{uid_str.lower()}{_ETX}'
+
+        def repl_agent_action(m):
+            uid, action = m.group(1), m.group(2).rstrip('/')
+            name = lookup_name(uid)
+            actions = {
+                'about':          f'[Profile: {name}]',
+                'inspect':        f'[Avatar: {name}]',
+                'im':             f'[IM: {name}]',
+                'mention':        f'@{name}',
+                'offerteleport':  f'[Offer TP to: {name}]',
+                'pay':            f'[Pay: {name}]',
+                'requestfriend':  f'[Friend Request: {name}]',
+                'mute':           f'[Mute: {name}]',
+                'unmute':         f'[Unmute: {name}]',
+                'completename':   name,
+                'complete':       name,
+                'displayname':    name,
+                'username':       lookup_name(uid, uid),
+            }
+            return actions.get(action, f'[Avatar({action}): {name}]')
+
+        # /app/agent/<uuid>/<action>
+        text = re.sub(
+            rf'secondlife:///app/agent/({UUID_RE})/([a-z]+)/?',
+            repl_agent_action, text, flags=re.IGNORECASE)
+
+        def lookup_group_name(uid_str):
+            """Return the cached group name or a typed sentinel for retroactive resolution."""
+            key = uid_str.lower()
+            if self.sl_agent:
+                cached = self.sl_agent.group_name_cache.get(key)
+                if cached:
+                    return cached
+                self.sl_agent.get_group_name(key)
+            return f'{_STX}R:group:{key}{_ETX}'
+
+        # /app/group/<uuid>/about  and  /app/group/<uuid>/inspect
+        def repl_group_action(m):
+            uid, action = m.group(1), m.group(2).rstrip('/')
+            gname = lookup_group_name(uid)
+            labels = {'about': f'[Group: {gname}]', 'inspect': f'[Group Info: {gname}]'}
+            return labels.get(action, f'[Group({action}): {gname}]')
+        text = re.sub(
+            rf'secondlife:///app/group/({UUID_RE})/([a-z]+)/?',
+            repl_group_action, text, flags=re.IGNORECASE)
+
+        # /app/group/create
+        text = re.sub(
+            r'secondlife:///app/group/create/?',
+            '[Create Group]', text, flags=re.IGNORECASE)
+
+        # /app/group/list/show
+        text = re.sub(
+            r'secondlife:///app/group/list/show/?',
+            '[My Groups]', text, flags=re.IGNORECASE)
+
+        # /app/classified/<id>/about
+        text = re.sub(
+            rf'secondlife:///app/classified/({UUID_RE})/about/?',
+            r'[Classified]', text, flags=re.IGNORECASE)
+
+        # /app/event/<id>/about
+        text = re.sub(
+            r'secondlife:///app/event/(\d+)/about/?',
+            r'[Event]', text, flags=re.IGNORECASE)
+
+        # /app/experience/<id>/profile
+        text = re.sub(
+            rf'secondlife:///app/experience/({UUID_RE})/profile/?',
+            r'[Experience]', text, flags=re.IGNORECASE)
+
+        # /app/inventory/<id>/select
+        text = re.sub(
+            rf'secondlife:///app/inventory/({UUID_RE})/select/?',
+            r'[Inventory Item]', text, flags=re.IGNORECASE)
+
+        # /app/inventory/show
+        text = re.sub(
+            r'secondlife:///app/inventory/show/?',
+            '[Open Inventory]', text, flags=re.IGNORECASE)
+
+        # /app/objectim/<id>?name=...&owner=...&slurl=...
+        def repl_objectim(m):
+            params_str = m.group(2) or ''
+            params = {}
+            for part in params_str.split('&'):
+                if '=' in part:
+                    k, v = part.split('=', 1)
+                    params[urllib.parse.unquote_plus(k)] = urllib.parse.unquote_plus(v)
+            obj_name = params.get('name', 'Object')
+            slurl    = params.get('slurl', '')
+            owner_id = params.get('owner', '')
+            owner    = lookup_name(owner_id, owner_id) if owner_id else ''
+            parts = [f'[Object: {obj_name}']
+            if slurl:
+                parts.append(f'@ {slurl}')
+            if owner:
+                parts.append(f'owner: {owner}')
+            return ' '.join(parts) + ']'
+        text = re.sub(
+            rf'secondlife:///app/objectim/({UUID_RE})(\?[^\s]*)?',
+            repl_objectim, text, flags=re.IGNORECASE)
+
+        # /app/parcel/<uuid>/about  — parcel UUID, resolvable via world.secondlife.com/place/<uuid>
+        def lookup_parcel_name(uid_str):
+            """Return cached parcel name or a typed sentinel for retroactive resolution."""
+            key = uid_str.lower()
+            if self.sl_agent:
+                cached = self.sl_agent.parcel_name_cache.get(key)
+                if cached:
+                    return cached
+                self.sl_agent.get_parcel_name(key)
+            return f'{_STX}R:parcel:{key}{_ETX}'
+
+        def repl_parcel_action(m):
+            uid = m.group(1)
+            pname = lookup_parcel_name(uid)
+            return f'[Parcel: {pname}]'
+        text = re.sub(
+            rf'secondlife:///app/parcel/({UUID_RE})/about/?',
+            repl_parcel_action, text, flags=re.IGNORECASE)
+
+        # /app/search/<category>/<term>
+        def repl_search(m):
+            cat, term = m.group(1), urllib.parse.unquote_plus(m.group(2))
+            return f'[Search ({cat}): {term}]'
+        text = re.sub(
+            r'secondlife:///app/search/([^/\s]+)/([^\s]*)',
+            repl_search, text, flags=re.IGNORECASE)
+
+        # /app/sharewithavatar/<uuid>
+        def repl_sharewith(m):
+            name = lookup_name(m.group(1))
+            return f'[Share with: {name}]'
+        text = re.sub(
+            rf'secondlife:///app/sharewithavatar/({UUID_RE})/?',
+            repl_sharewith, text, flags=re.IGNORECASE)
+
+        # /app/teleport/<region>/<x>/<y>/<z>
+        def repl_teleport(m):
+            region = urllib.parse.unquote_plus(m.group(1).replace('+', ' '))
+            coords = '/'.join(filter(None, [m.group(2), m.group(3), m.group(4)]))
+            return f'[Teleport to: {region} ({coords})]' if coords else f'[Teleport to: {region}]'
+        text = re.sub(
+            r'secondlife:///app/teleport/([^/\s]+)(?:/(\d+)(?:/(\d+)(?:/(\d+))?)?)?/?',
+            repl_teleport, text, flags=re.IGNORECASE)
+
+        # /app/worldmap/<region>/<x>/<y>/<z>
+        def repl_worldmap(m):
+            region = urllib.parse.unquote_plus(m.group(1).replace('+', ' '))
+            coords = '/'.join(filter(None, [m.group(2), m.group(3), m.group(4)]))
+            return f'[Map: {region} ({coords})]' if coords else f'[Map: {region}]'
+        text = re.sub(
+            r'secondlife:///app/worldmap/([^/\s]+)(?:/(\d+)(?:/(\d+)(?:/(\d+))?)?)?/?',
+            repl_worldmap, text, flags=re.IGNORECASE)
+
+        # /app/maptrackavatar/<uuid>
+        def repl_maptrack(m):
+            name = lookup_name(m.group(1))
+            return f'[Track on Map: {name}]'
+        text = re.sub(
+            rf'secondlife:///app/maptrackavatar/({UUID_RE})/?',
+            repl_maptrack, text, flags=re.IGNORECASE)
+
+        # /app/voicecallavatar/<uuid>
+        def repl_voicecall(m):
+            name = lookup_name(m.group(1))
+            return f'[Voice Call: {name}]'
+        text = re.sub(
+            rf'secondlife:///app/voicecallavatar/({UUID_RE})/?',
+            repl_voicecall, text, flags=re.IGNORECASE)
+
+        # /app/openfloater/<name>
+        text = re.sub(
+            r'secondlife:///app/openfloater/([^\s?]+)/?',
+            lambda m: f'[Open: {m.group(1)}]', text, flags=re.IGNORECASE)
+
+        # /app/help/<topic>
+        text = re.sub(
+            r'secondlife:///app/help/([^\s]*)/?',
+            lambda m: f'[Help: {urllib.parse.unquote_plus(m.group(1))}]' if m.group(1) else '[Help]',
+            text, flags=re.IGNORECASE)
+
+        # /app/balance/request
+        text = re.sub(
+            r'secondlife:///app/balance/request/?',
+            '[L$ Balance Update]', text, flags=re.IGNORECASE)
+
+        # /app/appearance/show
+        text = re.sub(
+            r'secondlife:///app/appearance/show/?',
+            '[Appearance]', text, flags=re.IGNORECASE)
+
+        # /app/wear_folder/?folder_id=<uuid>  or  /?folder_name=<name>
+        def repl_wear(m):
+            qs = m.group(1) or ''
+            params = {}
+            for part in qs.lstrip('?').split('&'):
+                if '=' in part:
+                    k, v = part.split('=', 1)
+                    params[k] = urllib.parse.unquote_plus(v)
+            label = params.get('folder_name') or params.get('folder_id', 'folder')
+            return f'[Wear Folder: {label}]'
+        text = re.sub(
+            r'secondlife:///app/wear_folder/?(\?[^\s]*)?',
+            repl_wear, text, flags=re.IGNORECASE)
+
+        # /app/login  (bare)
+        text = re.sub(
+            r'secondlife:///app/login/?',
+            '[Login]', text, flags=re.IGNORECASE)
+
+        # /app/chat/<channel>/<text>
+        def repl_chat_uri(m):
+            channel, chat_text = m.group(1), urllib.parse.unquote_plus(m.group(2))
+            return f'[Chat ch{channel}: {chat_text}]'
+        text = re.sub(
+            r'secondlife:///app/chat/(\d+)/([^\s]*)',
+            repl_chat_uri, text, flags=re.IGNORECASE)
+
+        # /app/keybinding/<action>  (just label it)
+        text = re.sub(
+            r'secondlife:///app/keybinding/([^\s?]+)(?:\?[^\s]*)?',
+            lambda m: f'[Keybinding: {m.group(1)}]', text, flags=re.IGNORECASE)
+
+        # Classic SLURL: secondlife://<region>/<x>/<y>/<z>
+        def repl_classic_slurl(m):
+            region = urllib.parse.unquote_plus(m.group(1).replace('+', ' '))
+            coords = '/'.join(filter(None, [m.group(2), m.group(3), m.group(4)]))
+            return f'[SLURL: {region} ({coords})]' if coords else f'[SLURL: {region}]'
+        text = re.sub(
+            r'secondlife://([^/\s]+)(?:/(\d+)(?:/(\d+)(?:/(\d+))?)?)?/?',
+            repl_classic_slurl, text, flags=re.IGNORECASE)
+
+        return text
+
+    # Sentinel pattern: \x02R:<type>:<uuid>\x03  (type = agent | group | parcel)
+    _SENTINEL_RE = re.compile(r'\x02R:(agent|group|parcel):([0-9a-f\-]{36})\x03')
+
+    # Regex for http/https URLs AND bare www. URLs.
+    # www. branch: requires www. + hostname label(s) + '.' + TLD (>=2 letters),
+    # with an optional path — prevents false positives on random words.
+    _URL_RE = re.compile(
+        r'(?:https?://[^\s<>"\')\]}]+'          # full URL with scheme
+        r'|(?<![\w.])www\.[a-zA-Z0-9][a-zA-Z0-9\-]*'
+        r'(?:\.[a-zA-Z0-9][a-zA-Z0-9\-]*)*'
+        r'\.[a-zA-Z]{2,}(?:[/\?#][^\s<>"\')\]}]*)?)'
+    )
+
+    def _insert_chunk_with_links(self, chunk, base_tags):
+        """
+        Insert a plain-text *chunk* into chat_display, detecting http/https URLs
+        and rendering them as clickable cyan underlined hyperlinks.
+        *base_tags* is a tuple of any already-active tags to apply to plain text.
+        """
+        segments = self._URL_RE.split(chunk)
+        urls = self._URL_RE.findall(chunk)
+
+        for idx, seg in enumerate(segments):
+            if seg:
+                self.chat_display.insert(tk.END, seg, base_tags)
+            if idx < len(urls):
+                url = urls[idx]
+                # Create a unique tag for this specific link instance
+                self._link_counter += 1
+                link_tag = f'link_{self._link_counter}'
+                all_link_tags = (link_tag, 'hyperlink') + base_tags
+                self.chat_display.tag_config(link_tag, foreground='#00BFFF', underline=True)
+                # Bind click to open URL in browser
+                self.chat_display.tag_bind(
+                    link_tag, '<Button-1>',
+                    lambda e, u=url: self._open_url(u)
+                )
+                # Cursor changes on hover for clear affordance
+                self.chat_display.tag_bind(
+                    link_tag, '<Enter>',
+                    lambda e: self.chat_display.config(cursor='hand2')
+                )
+                self.chat_display.tag_bind(
+                    link_tag, '<Leave>',
+                    lambda e: self.chat_display.config(cursor='')
+                )
+                self.chat_display.insert(tk.END, url, all_link_tags)
+
+    def _open_url(self, url):
+        """Open *url* in the system default browser.
+        Prepends https:// for bare www. URLs that have no scheme.
+        """
+        import webbrowser
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+        webbrowser.open(url)
+
+    def _insert_with_uri_tags(self, text, extra_tag=None):
+        """
+        Insert *text* into chat_display, expanding \x02R:<type>:<uuid>\x03 sentinels
+        into grey italic 'Resolving\u2026' spans tagged 'sluri_<type>_<uuid>'.
+        When the name resolves, _replace_resolving_spans() patches the span and
+        turns it into a cyan clickable hyperlink.
+        Also converts http/https URLs into clickable hyperlinks.
+        """
+        parts = self._SENTINEL_RE.split(text)
+        # split gives: [plain, type, uuid, plain, type, uuid, ...] (2 capture groups)
+        base_tags = (extra_tag,) if extra_tag else ()
+        i = 0
+        while i < len(parts):
+            chunk = parts[i]
+            if chunk:
+                self._insert_chunk_with_links(chunk, base_tags)
+            i += 1
+            if i + 1 < len(parts):          # need both type and uuid
+                entity_type = parts[i]      # 'agent' | 'group' | 'parcel'
+                entity_uuid = parts[i + 1]  # the UUID
+                tag = f'sluri_{entity_type}_{entity_uuid}'
+                # Grey italic while unresolved
+                self.chat_display.tag_config(
+                    tag, foreground='#888888', font=('Courier', 10, 'italic'))
+                display_tags = (tag,) + base_tags
+                self.chat_display.insert(tk.END, 'Resolving\u2026', display_tags)
+                i += 2
 
     def _append_chat(self, message, name=None):
+        message = self._resolve_sl_uris(message)
         self.chat_display.config(state='normal')
-        
+
         if name:
-            self.chat_display.insert(tk.END, "[")
+            self.chat_display.insert(tk.END, '[')
             self.chat_display.insert(tk.END, name, 'speaker_name')
-            self.chat_display.insert(tk.END, "]: " + message + "\n")
+            self.chat_display.insert(tk.END, ']: ')
+            self._insert_with_uri_tags(message)
+            self.chat_display.insert(tk.END, '\n')
         else:
-            self.chat_display.insert(tk.END, message + "\n")
+            self._insert_with_uri_tags(message)
+            self.chat_display.insert(tk.END, '\n')
             
         self.chat_display.config(state='disabled')
         self.chat_display.see(tk.END) 
@@ -4596,10 +5490,8 @@ class ChatTab(ttk.Frame):
         teleport_id = offer_data['id']
         
         dialog_text = f"You have received a teleport offer to: {region_name}"
-        if cost > 0:
-            dialog_text += f"\nThis teleport will cost L${cost}."
         
-        self.sl_agent.log(f"Teleport offer received for {region_name} (Cost: L${cost}).")
+        self.sl_agent.log(f"Teleport offer received for {region_name}.")
         
         # MODIFIED: Use ThemedMessageBox instead of messagebox.askyesno
         dialog_result = ThemedMessageBox(self.master, "Teleport Offer Received", dialog_text, 'yesno').result
@@ -4718,7 +5610,7 @@ class LoginPanel(ttk.Frame):
         # 1. Saved Credentials Dropdown
         ttk.Label(content_frame, text="Saved Profile:", style='BlackGlass.TLabel', anchor='e').grid(row=row, column=0, sticky='e', pady=5, padx=5)
         
-        self.profile_names = ["-- New Login --"] + [f"{c['first']} {c['last']} ({c['region']})" for c in self.credentials]
+        self.profile_names = ["-- New Login --"] + [f"{c['first']} {c['last']} ({c['region']})".replace(" Resident", "") for c in self.credentials]
         self.selected_profile = tk.StringVar(value=self.profile_names[0])
         
         self.profile_dropdown = ttk.Combobox(content_frame, 
@@ -4796,7 +5688,7 @@ class LoginPanel(ttk.Frame):
     def update_dropdown_data(self):
         """Loads credentials and refreshes the dropdown without destroying the panel."""
         self.credentials = load_credentials()
-        self.profile_names = ["-- New Login --"] + [f"{c['first']} {c['last']} ({c['region']})" for c in self.credentials]
+        self.profile_names = ["-- New Login --"] + [f"{c['first']} {c['last']} ({c['region']})".replace(" Resident", "") for c in self.credentials]
         
         # Reconfigure the combobox with new values
         self.profile_dropdown.config(values=self.profile_names)
@@ -5004,7 +5896,7 @@ class MultiClientApp(tk.Tk):
             
         # 1. Create the new tab and give it the agent's name
         chat_tab = ChatTab(self.notebook, agent, first, last, self)
-        tab_name = f"{first} {last}"
+        tab_name = f"{first} {last}".replace(" Resident", "")
         
         # 2. Add to notebook and select it
         self.notebook.add(chat_tab, text=tab_name)
