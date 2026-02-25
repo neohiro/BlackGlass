@@ -2856,21 +2856,25 @@ class SecondLifeAgent:
                 if uid in self.fetching_names:
                     self.fetching_names.remove(uid)
 
-    def get_group_name(self, group_id):
+    def get_group_name(self, group_id, force=False):
         """
         Return the cached group name for *group_id*, or kick off a background
         web-scrape fetch and return None so the caller can emit a sentinel.
+        If force=True, re-fetches even if cached.
         """
         key = str(group_id).lower()
-        cached = self.group_name_cache.get(key)
-        if cached:
-            return cached
-        if key not in self.fetching_groups:
-            self.fetching_groups.add(key)
-            threading.Thread(
-                target=self._fetch_group_name_task,
-                args=(key,), daemon=True).start()
-        return None
+        cached_name = self.group_name_cache.get(key)
+        cached_data = self.group_data_cache.get(key)
+        
+        # Start fetch if forced, missing name altogether, or if we only have the name but not rich data
+        if force or not cached_name or not cached_data:
+            if key not in self.fetching_groups:
+                self.fetching_groups.add(key)
+                threading.Thread(
+                    target=self._fetch_group_name_task,
+                    args=(key,), daemon=True).start()
+        
+        return cached_name if not force else None
 
     def _fetch_group_name_task(self, group_uuid):
         """
@@ -2894,6 +2898,10 @@ class SecondLifeAgent:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 if resp.getcode() == 200:
                     html = resp.read().decode('utf-8', errors='replace')
+                    
+                    # Strip comments to avoid matching commented-out meta tags
+                    html = re.sub(r'<!--.*?-->', '', html, flags=re.DOTALL)
+                    
                     # The <title> tag holds the group name on this page
                     title_m = re.search(r'<title[^>]*>([^<]+)</title>', html, re.IGNORECASE)
                     if title_m:
@@ -2915,14 +2923,16 @@ class SecondLifeAgent:
                         # Robust meta-tag parser: iterate each <meta> tag, check attrs separately
                         def _meta(attr_name, _html=html):
                             for _tag in re.findall(r'<meta\b[^>]*>', _html, re.IGNORECASE):
-                                _nm = re.search(r'\bname=["\']([^"\']+)["\']', _tag, re.IGNORECASE)
+                                _nm = re.search(r'\b(?:name|property)=["\']([^"\']+)["\']', _tag, re.IGNORECASE)
                                 _ct = re.search(r'\bcontent=["\']([^"\']*)["\']', _tag, re.IGNORECASE)
                                 if _nm and _nm.group(1).strip().lower() == attr_name.lower() and _ct:
-                                    return html_parser.unescape(_ct.group(1).strip())
+                                    content = html_parser.unescape(_ct.group(1).strip())
+                                    if content:
+                                        return content
                             return ''
                         data = {
                             'name': name,
-                            'description': _meta('description'),
+                            'description': _meta('description') or _meta('og:description'),
                             'member_count': _meta('member_count'),
                             'open_enrollment': _meta('open_enrollment'),
                             'membership_fee': _meta('membership_fee'),
@@ -2941,21 +2951,25 @@ class SecondLifeAgent:
         finally:
             self.fetching_groups.discard(group_uuid)
 
-    def get_parcel_name(self, parcel_id):
+    def get_parcel_name(self, parcel_id, force=False):
         """
         Return the cached parcel name for *parcel_id* (a UUID string), or kick
         off a background web-scrape fetch and return None for a sentinel.
+        If force=True, re-fetches even if cached.
         """
         key = str(parcel_id).lower()
-        cached = self.parcel_name_cache.get(key)
-        if cached:
-            return cached
-        if key not in self.fetching_parcels:
-            self.fetching_parcels.add(key)
-            threading.Thread(
-                target=self._fetch_parcel_name_task,
-                args=(key,), daemon=True).start()
-        return None
+        cached_name = self.parcel_name_cache.get(key)
+        cached_data = self.parcel_data_cache.get(key)
+
+        # Start fetch if forced, missing name altogether, or if we only have the name but not rich data
+        if force or not cached_name or not cached_data:
+            if key not in self.fetching_parcels:
+                self.fetching_parcels.add(key)
+                threading.Thread(
+                    target=self._fetch_parcel_name_task,
+                    args=(key,), daemon=True).start()
+        
+        return cached_name if not force else None
 
     def _fetch_parcel_name_task(self, parcel_uuid):
         """
@@ -2979,42 +2993,117 @@ class SecondLifeAgent:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 if resp.getcode() == 200:
                     html = resp.read().decode('utf-8', errors='replace')
-                    # Try <title> tag first
-                    title_m = re.search(r'<title[^>]*>([^<]+)</title>', html, re.IGNORECASE)
-                    if title_m:
-                        title = html_parser.unescape(title_m.group(1).strip())
-                        # Strip common suffixes added by world.secondlife.com
-                        for suffix in (' | Second Life', ' - Second Life'):
-                            if title.endswith(suffix):
-                                title = title[:-len(suffix)].strip()
-                                break
-                        name = title
-                    else:
-                        # Fallback: look for og:title
-                        og_m = re.search(
-                            r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)',
+                    
+                    # Strip comments to avoid matching commented-out meta tags
+                    html = re.sub(r'<!--.*?-->', '', html, flags=re.DOTALL)
+                    
+                    # Try og:title, then meta parcel, then <title> tag
+                    name = ''
+                    og_m = re.search(
+                        r'<meta[^>]+(?:property|name)=["\']og:title["\'][^>]+content=["\']([^"\']+)',
+                        html, re.IGNORECASE)
+                    if og_m:
+                        name = html_parser.unescape(og_m.group(1).strip())
+                    
+                    if not name:
+                        parcel_m = re.search(
+                            r'<meta[^>]+name=["\']parcel["\'][^>]+content=["\']([^"\']+)',
                             html, re.IGNORECASE)
-                        name = html_parser.unescape(og_m.group(1).strip()) if og_m else ''
+                        if parcel_m:
+                            name = html_parser.unescape(parcel_m.group(1).strip())
+
+                    if not name:
+                        title_m = re.search(r'<title[^>]*>([^<]+)</title>', html, re.IGNORECASE)
+                        if title_m:
+                            title = html_parser.unescape(title_m.group(1).strip())
+                            for suffix in (' | Second Life', ' - Second Life'):
+                                if title.endswith(suffix):
+                                    title = title[:-len(suffix)].strip()
+                                    break
+                            name = title
+
                     if name:
                         self.parcel_name_cache[parcel_uuid] = name
                         # Parse rich meta data
-                        # Robust meta-tag parser: iterate each <meta> tag, check attrs separately
                         def _pmeta(attr_name, _html=html):
                             for _tag in re.findall(r'<meta\b[^>]*>', _html, re.IGNORECASE):
-                                _nm = re.search(r'\bname=["\']([^"\']+)["\']', _tag, re.IGNORECASE)
+                                _nm = re.search(r'\b(?:name|property)=["\']([^"\']+)["\']', _tag, re.IGNORECASE)
                                 _ct = re.search(r'\bcontent=["\']([^"\']*)["\']', _tag, re.IGNORECASE)
                                 if _nm and _nm.group(1).strip().lower() == attr_name.lower() and _ct:
-                                    return html_parser.unescape(_ct.group(1).strip())
+                                    content = html_parser.unescape(_ct.group(1).strip())
+                                    if content: # Only return if not empty
+                                        return content
                             return ''
+                        
+                        desc = _pmeta('description') or _pmeta('og:description')
+                        if not desc or desc.strip().lower() in ('second life', ''):
+                            # Primary: Scrape <p class="desc"> — the actual SL place page element
+                            desc_match = re.search(r'<p[^>]+class=["\'][^"\']*\bdesc\b[^"\']*["\'][^>]*>(.*?)</p>', html, re.S | re.I)
+                            if desc_match:
+                                raw_desc = desc_match.group(1)
+                                raw_desc = re.sub(r'<br\s*/?>', '\n', raw_desc, flags=re.I)
+                                raw_desc = re.sub(r'<[^>]+>', '', raw_desc)
+                                desc = html_parser.unescape(raw_desc).strip()
+
+                        if not desc or desc.strip().lower() in ('second life', ''):
+                            # Fallback: Scrape <div class="description"> from body
+                            desc_match = re.search(r'<div[^>]+class=["\'][^"\']*description[^"\']*["\'][^>]*>(.*?)</div>', html, re.S | re.I)
+                            if desc_match:
+                                raw_desc = desc_match.group(1)
+                                raw_desc = re.sub(r'<br\s*/?>', '\n', raw_desc, flags=re.I)
+                                raw_desc = re.sub(r'<[^>]+>', '', raw_desc)
+                                desc = html_parser.unescape(raw_desc).strip()
+
+                        if not desc or desc.strip().lower() in ('second life', ''):
+                            # Fallback: Scrape the main content body paragraph (SL place pages
+                            # put the parcel description as a standalone <p> in a content area)
+                            # Look for a paragraph inside an id/class that sounds like content
+                            body_p = re.search(
+                                r'<(?:div|section)[^>]+(?:id|class)=["\'][^"\']*(content|main|place|about|info)[^"\']["\'][^>]*>.*?<p[^>]*>([^<]{20,})</p>',
+                                html, re.S | re.I)
+                            if body_p:
+                                desc = html_parser.unescape(body_p.group(2).strip())
+
+                        if not desc or desc.strip().lower() in ('second life', ''):
+                            # Last resort: grab the first substantial <p> in the whole body
+                            # that is not navigation boilerplate
+                            all_ps = re.findall(r'<p[^>]*>([^<]{30,})</p>', html, re.I)
+                            for candidate in all_ps:
+                                clean = html_parser.unescape(candidate.strip())
+                                # Skip LL boilerplate phrases
+                                if not any(skip in clean.lower() for skip in ('second life', 'linden', 'join now', 'quick start', 'marketplace')):
+                                    desc = clean
+                                    break
+
+                        # Improved image scraping
+                        snapshot = _pmeta('snapshot') or _pmeta('og:image')
+                        if not snapshot:
+                            # Try <link rel="image_src" ...>
+                            img_src_m = re.search(r'<link[^>]+rel=["\']image_src["\'][^>]+href=["\']([^"\']+)["\']', html, re.I)
+                            if img_src_m:
+                                snapshot = html_parser.unescape(img_src_m.group(1).strip())
+                        if not snapshot:
+                            # Primary: Scrape <img class="parcelimg" src="..."> — the actual SL place page image element
+                            img_m = re.search(r'<img[^>]+class=["\'][^"\']*\bparcelimg\b[^"\']*["\'][^>]+src=["\']([^"\']+)["\']', html, re.I)
+                            if not img_m:
+                                # Also try src before class attribute order
+                                img_m = re.search(r'<img[^>]+src=["\']([^"\']+)["\'][^>]+class=["\'][^"\']*\bparcelimg\b[^"\']*["\']', html, re.I)
+                            if img_m:
+                                snapshot = html_parser.unescape(img_m.group(1).strip())
+
                         data = {
                             'name': name,
-                            'description': _pmeta('description'),
+                            'description': desc or '',
                             'region': _pmeta('region'),
                             'location': _pmeta('location'),
-                            'snapshot': _pmeta('snapshot'),
+                            'snapshot': snapshot,
                             'image_id': _pmeta('imageid'),
                             'mat': _pmeta('mat'),
+                            'category': _pmeta('category'),
+                            'owner': _pmeta('owner'),
+                            'area': _pmeta('area'),
                             'id': parcel_uuid,
+                            'source': 'web'
                         }
                         self.parcel_data_cache[parcel_uuid] = data
                         self.ui_callback('update_parcel_name', (parcel_uuid, data))
@@ -3884,15 +3973,20 @@ class ThemedGroupDialog(Toplevel):
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         def lbl(parent, label, value, fg=None):
+            is_loading = d.get('source') != 'web'
+            display_value = value if value else ('...' if is_loading else None)
+            if not display_value: return
+
             ttk.Label(parent, text=label, style='BlackGlass.TLabel',
                       font=('Helvetica', 10, 'bold')).pack(anchor='w')
-            kw = {'style': 'BlackGlass.TLabel', 'anchor': 'w', 'padx': 5}
+            kw = {'style': 'BlackGlass.TLabel', 'anchor': 'w'}
             if fg: kw['foreground'] = fg
-            ttk.Label(parent, text=value or '—', **kw).pack(anchor='w', pady=(0, 6))
+            ttk.Label(parent, text=display_value, **kw).pack(anchor='w', pady=(0, 6), padx=5)
 
         # Group Description (About / Charter)
         desc = d.get('description', '').strip()
-        if desc:
+        is_loading = d.get('source') != 'web'
+        if desc or is_loading:
             ttk.Label(right, text='Group Information:', style='BlackGlass.TLabel',
                       font=('Helvetica', 10, 'bold')).pack(anchor='w')
             txt = tk.Text(right, height=12, width=42,
@@ -3900,20 +3994,21 @@ class ThemedGroupDialog(Toplevel):
                           relief=tk.FLAT, highlightthickness=1,
                           highlightbackground='#333333', wrap=tk.WORD, cursor='arrow')
             txt.tag_config('hyperlink', foreground='#00BFFF', underline=True)
-            txt.insert(tk.END, desc)
+            txt.insert(tk.END, desc or 'Loading group info...')
             
-            # Detect and tag URLs in the group description
-            url_pattern = re.compile(r'https?://[^\s\]\[<>\"\']+', re.I)
-            for match in url_pattern.finditer(desc):
-                start_i = f"1.0 + {match.start()} chars"
-                end_i = f"1.0 + {match.end()} chars"
-                link_tag = f"link_{match.start()}"
-                url = match.group(0)
-                txt.tag_add(link_tag, start_i, end_i)
-                txt.tag_config(link_tag, foreground='#00BFFF', underline=True)
-                txt.tag_bind(link_tag, '<Button-1>', lambda e, u=url: __import__('webbrowser').open(u))
-                txt.tag_bind(link_tag, '<Enter>', lambda e: txt.config(cursor='hand2'))
-                txt.tag_bind(link_tag, '<Leave>', lambda e: txt.config(cursor='arrow'))
+            if desc:
+                # Detect and tag URLs in the group description
+                url_pattern = re.compile(r'https?://[^\s\]\[<>\"\']+', re.I)
+                for match in url_pattern.finditer(desc):
+                    start_i = f"1.0 + {match.start()} chars"
+                    end_i = f"1.0 + {match.end()} chars"
+                    link_tag = f"link_{match.start()}"
+                    url = match.group(0)
+                    txt.tag_add(link_tag, start_i, end_i)
+                    txt.tag_config(link_tag, foreground='#00BFFF', underline=True)
+                    txt.tag_bind(link_tag, '<Button-1>', lambda e, u=url: __import__('webbrowser').open(u))
+                    txt.tag_bind(link_tag, '<Enter>', lambda e: txt.config(cursor='hand2'))
+                    txt.tag_bind(link_tag, '<Leave>', lambda e: txt.config(cursor='arrow'))
 
             txt.config(state='disabled')
             txt.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
@@ -3932,6 +4027,12 @@ class ThemedGroupDialog(Toplevel):
 
         ttk.Button(self, text='Close', width=12, command=self.on_close,
                    style='BlackGlass.TButton').pack(pady=(0, 10))
+
+    def update_data(self, new_data):
+        self.data.update(new_data)
+        self.title(f"Group: {self.data.get('name', 'Unknown')}")
+        self._setup_ui()
+        self.lift()
 
     def _fetch_image(self, image_id):
         if not PIL_AVAILABLE:
@@ -4003,7 +4104,7 @@ class ThemedParcelDialog(Toplevel):
         # Try snapshot URL first, then imageid
         snap_url = d.get('snapshot', '')
         image_id = d.get('image_id', '')
-        if snap_url:
+        if snap_url and snap_url.startswith('http'):
             self._img_label.configure(text='Loading…')
             threading.Thread(target=self._fetch_url_image, args=(snap_url,), daemon=True).start()
         elif image_id and image_id != '00000000-0000-0000-0000-000000000000':
@@ -4016,31 +4117,49 @@ class ThemedParcelDialog(Toplevel):
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         def lbl(label, value, fg=None):
-            if not value: return
+            display_value = value if value else ('...' if is_loading else None)
+            if not display_value: return
+
             ttk.Label(right, text=label, style='BlackGlass.TLabel',
                       font=('Helvetica', 10, 'bold')).pack(anchor='w')
-            kw = {'style': 'BlackGlass.TLabel', 'anchor': 'w', 'padx': 5}
+            kw = {'style': 'BlackGlass.TLabel', 'anchor': 'w'}
             if fg: kw['foreground'] = fg
-            ttk.Label(right, text=value, **kw).pack(anchor='w', pady=(0, 6))
+            ttk.Label(right, text=display_value, **kw).pack(anchor='w', pady=(0, 6), padx=5)
+
+        is_loading = d.get('source') != 'web'
 
         region   = d.get('region', '')
         location = d.get('location', '')
         mat      = d.get('mat', '')
+        category = d.get('category', '')
+        owner    = d.get('owner', '')
+        area     = d.get('area', '')
+
         lbl('Region:', region)
         lbl('Location:', location)
         if mat:
             mat_labels = {'PG': 'General', 'M_AO': 'Moderate', 'A_AO': 'Adult'}
             lbl('Maturity:', mat_labels.get(mat.upper(), mat))
+        # Filter out the placeholder 'Loading...' owner value from the SL website
+        if owner and owner.strip().lower() != 'loading...':
+            lbl('Owner:', owner)
+        if category:
+            lbl('Category:', category)
+        if area:
+            try:
+                lbl('Area:', f'{int(area):,} m\u00b2')
+            except ValueError:
+                lbl('Area:', area)
 
         desc = d.get('description', '').strip()
-        if desc:
+        if desc or is_loading:
             ttk.Label(right, text='Description:', style='BlackGlass.TLabel',
                       font=('Helvetica', 10, 'bold')).pack(anchor='w')
             txt = tk.Text(right, height=6, width=42,
                           bg='#1E1E1E', fg='#CCCCCC', font=('Helvetica', 10),
                           relief=tk.FLAT, highlightthickness=1,
                           highlightbackground='#333333', wrap=tk.WORD, cursor='arrow')
-            txt.insert(tk.END, desc)
+            txt.insert(tk.END, desc or 'Loading parcel info...')
             txt.config(state='disabled')
             txt.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
@@ -4078,6 +4197,13 @@ class ThemedParcelDialog(Toplevel):
 
         ttk.Button(btn_row, text='Close', width=12, command=self.on_close,
                    style='BlackGlass.TButton').pack(side=tk.LEFT)
+
+
+    def update_data(self, new_data):
+        self.data.update(new_data)
+        self.title(f"Parcel: {self.data.get('name', 'Unknown')}")
+        self._setup_ui()
+        self.lift()
 
 
     def _fetch_url_image(self, url):
@@ -4994,6 +5120,12 @@ class ChatTab(ttk.Frame):
                 if isinstance(d, dict):
                     self.sl_agent.group_data_cache[u] = d
                 self._replace_resolving_spans(f'sluri_group_{u}', n)
+                # Update open dialog if it exists
+                key = f'group_{u}'
+                if key in self.active_profiles:
+                    dialog = self.active_profiles[key]
+                    if dialog.winfo_exists() and hasattr(dialog, 'update_data'):
+                        dialog.update_data(d)
             self.after(0, _patch_group)
 
         elif update_type == "update_parcel_name":
@@ -5004,6 +5136,12 @@ class ChatTab(ttk.Frame):
                 if isinstance(d, dict):
                     self.sl_agent.parcel_data_cache[u] = d
                 self._replace_resolving_spans(f'sluri_parcel_{u}', n)
+                # Update open dialog if it exists
+                key = f'parcel_{u}'
+                if key in self.active_profiles:
+                    dialog = self.active_profiles[key]
+                    if dialog.winfo_exists() and hasattr(dialog, 'update_data'):
+                        dialog.update_data(d)
             self.after(0, _patch_parcel)
             
         elif update_type == "clear_map":
@@ -5030,21 +5168,33 @@ class ChatTab(ttk.Frame):
             # Kick off the async profile fetch (will call update_ui('show_profile', ...) when done)
             self.sl_agent.request_avatar_properties(uid)
         elif entity_type == 'group':
+            # Trigger fetch if data is missing or incomplete
+            self.sl_agent.get_group_name(uid)
             data = self.sl_agent.group_data_cache.get(uid, {})
             if not data:
-                data = {'name': self.sl_agent.group_name_cache.get(uid, uid), 'id': uid}
+                data = {'name': self.sl_agent.group_name_cache.get(uid, uid), 'id': uid, 'description': 'Loading group info...'}
             key = f'group_{uid}'
             if key in self.active_profiles and self.active_profiles[key].winfo_exists():
                 self.active_profiles[key].lift()
             else:
                 self.active_profiles[key] = ThemedGroupDialog(self.master, data, self, key)
         elif entity_type == 'parcel':
+            # Trigger fetch if data is missing or incomplete
+            self.sl_agent.get_parcel_name(uid)
             data = self.sl_agent.parcel_data_cache.get(uid, {})
             if not data:
-                data = {'name': self.sl_agent.parcel_name_cache.get(uid, uid), 'id': uid}
+                data = {'name': self.sl_agent.parcel_name_cache.get(uid, uid), 'id': uid, 'description': 'Loading parcel info...'}
             key = f'parcel_{uid}'
             if key in self.active_profiles and self.active_profiles[key].winfo_exists():
-                self.active_profiles[key].lift()
+                dialog = self.active_profiles[key]
+                # If the dialog is open but was showing loading state, refresh it now
+                # (handles the race condition where fetch completed after dialog opened
+                #  but _patch_parcel's update_data wasn't called yet)
+                cached_data = self.sl_agent.parcel_data_cache.get(uid, {})
+                if cached_data and cached_data.get('source') == 'web':
+                    if dialog.data.get('source') != 'web':
+                        dialog.update_data(cached_data)
+                dialog.lift()
             else:
                 self.active_profiles[key] = ThemedParcelDialog(self.master, data, self, key)
 
@@ -5257,17 +5407,18 @@ class ChatTab(ttk.Frame):
                     self.sl_agent.get_parcel_name(key)
             return f'{_STX}R:parcel:{key}{_ETX}'
 
+        # /app/parcel/<uuid>/about or /app/place/<uuid>/about
         def repl_parcel_action(m):
             uid = m.group(1)
             pname = lookup_parcel_name(uid)
             return f'[Parcel: {pname}]'
         text = re.sub(
-            rf'secondlife:///app/parcel/({UUID_RE})/(?:about|inspect|about)/?',
+            rf'secondlife:///app/(?:parcel|place)/({UUID_RE})/(?:about|inspect)/?',
             repl_parcel_action, text, flags=re.IGNORECASE)
 
-        # /app/parcel/<uuid> (no action)
+        # /app/parcel/<uuid> or /app/place/<uuid> (no action)
         text = re.sub(
-            rf'secondlife:///app/parcel/({UUID_RE})/?',
+            rf'secondlife:///app/(?:parcel|place)/({UUID_RE})/?',
             lambda m: lookup_parcel_name(m.group(1).lower()), text, flags=re.IGNORECASE)
 
         # /app/search/<category>/<term>
