@@ -10,11 +10,16 @@ Download and run the .exe file on the right in Releases to help test and improve
 
 ###
 
-Black Glass is a lightweight, high-performance Second Life client focused on multi-avatar chat management, navigation, and regional awareness. Built with a "Black Glass" aesthetic using Python and Tkinter, it provides a streamlined alternative to heavy 3D viewers for users who prioritize local communication and efficiency. You can find a list of Nearby Avatars in which you can select each one for a "Teleport To" or "Profile" option.
+Black Glass is a lightweight, high-performance Second Life client focused on multi-avatar chat management, navigation, and regional awareness. Built with a "Black Glass" aesthetic using Python and Tkinter, it provides a streamlined alternative to heavy 3D viewers for users who prioritize local communication and efficiency.
 
 # 🚀Features 
 ###
 ###
+## Updates
+
+1.4: URI namespaces are now resolved, groups, parcels and profiles are accessible in the viewer.
+1.3: You can find a list of Nearby Avatars in which you can select each one for a "Teleport To" or "Profile" option.
+
 ## 📨Advanced Chat & Communication
 
 Multi-Client Support: Log in with multiple accounts simultaneously using a tabbed interface.
