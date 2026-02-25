@@ -76,7 +76,7 @@ Pillow (PIL): Required for minimap image rendering.
 
 pip install Pillow
 
-Standard Libraries: tkinter, socket, threading, xmlrpc, ssl.
+Standard Libraries: tkinter, socket, threading, xmlrpc.
 
 # 🚀 Getting Started
 Download and run the .exe file in Releases or clone the repository or download BlackGlass.py.
