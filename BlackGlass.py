@@ -45,6 +45,10 @@ class LimitedScrolledText(scrolledtext.ScrolledText):
     def __init__(self, master=None, max_lines=1000, **kw):
         super().__init__(master, **kw)
         self.max_lines = max_lines
+        # Hide the built-in vertical scrollbar while keeping scroll functionality.
+        # ScrolledText stores it as self.vbar; setting width=0 makes it invisible.
+        self.vbar.config(width=0, takefocus=False)
+        self.vbar.pack_forget()
 
     def insert(self, index, chars, *args):
         super().insert(index, chars, *args)
@@ -978,6 +982,34 @@ class KickUser(BaseMessage):
     }
 registerMessage(KickUser)
 # --- END KICKUSER PACKET ---
+
+# --- INSTANT MESSAGE PACKETS ---
+class ImprovedInstantMessage(BaseMessage):
+    """
+    Received from the simulator when another avatar sends us a private IM.
+    Dialog types: 0 = plain IM, 9 = group notice, 19 = friendship offer, etc.
+    """
+    name = "ImprovedInstantMessage"; id = 254; freq = 2; trusted = True; zero_coded = True
+    blocks = [("AgentData", 1), ("MessageBlock", 1)]
+    structure = {
+        "AgentData": [("AgentID", "LLUUID"), ("SessionID", "LLUUID")],
+        "MessageBlock": [
+            ("FromGroup", "BOOL"),
+            ("ToAgentID", "LLUUID"),
+            ("ParentEstateID", "U32"),
+            ("RegionID", "LLUUID"),
+            ("Position", "LLVector3"),
+            ("Offline", "U8"),
+            ("Dialog", "U8"),
+            ("ID", "LLUUID"),
+            ("Timestamp", "U32"),
+            ("FromAgentName", "Variable", 1),
+            ("Message", "Variable", 2),
+            ("BinaryBucket", "Variable", 2),
+        ]
+    }
+registerMessage(ImprovedInstantMessage)
+# --- END INSTANT MESSAGE PACKETS ---
 
 
 # ==========================================
@@ -2984,9 +3016,7 @@ class SecondLifeAgent:
             req = urllib.request.Request(
                 url,
                 headers={
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                                  'AppleWebKit/537.36 (KHTML, like Gecko) '
-                                  'Chrome/120.0.0.0 Safari/537.36',
+                    'User-Agent': 'BlackGlass',
                     'Accept': 'text/html'
                 }
             )
@@ -4754,6 +4784,7 @@ class ChatTab(ttk.Frame):
                                                      insertbackground='white', 
                                                      relief=tk.FLAT, highlightthickness=1, highlightbackground='#444444')
         self.chat_display.grid(row=0, column=0, sticky='nsew', padx=(0, 0))
+        self.chat_display.bind("<Button-3>", self._show_chat_context_menu)
         
         # --- FIX: Configure tag for gray speaker name ---
         self.chat_display.tag_config('speaker_name', foreground='#AAAAAA')
@@ -4806,6 +4837,7 @@ class ChatTab(ttk.Frame):
                                       insertbackground='white', relief=tk.FLAT, highlightthickness=1, highlightbackground='#555555')
         self.message_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
         self.message_entry.bind("<Return>", self.send_message_event)
+        self.message_entry.bind("<Button-3>", self._show_entry_context_menu)
         
         self.send_button = ttk.Button(input_frame, text="Send", command=self.send_message, style='BlackGlass.TButton')
         self.send_button.pack(side=tk.RIGHT)
@@ -5707,6 +5739,96 @@ class ChatTab(ttk.Frame):
         else:
             self._update_status("Teleport offer declined.")
             self._append_notification(f"[INFO] Teleport offer to {region_name} declined.")
+
+    # ------------------------------------------------------------------ #
+    #  Right-click context menus                                         #
+    # ------------------------------------------------------------------ #
+
+    def _make_context_menu(self):
+        """Create a themed popup menu matching the BlackGlass dark style."""
+        menu = tk.Menu(self, tearoff=0,
+                       bg='#2C2C2C', fg='#E0E0E0',
+                       activebackground='#444444', activeforeground='#FFFFFF',
+                       relief=tk.FLAT, bd=1)
+        return menu
+
+    def _show_chat_context_menu(self, event):
+        """Right-click menu for the read-only chat display (copy / select-all)."""
+        menu = self._make_context_menu()
+
+        def do_copy():
+            try:
+                selected = self.chat_display.get(tk.SEL_FIRST, tk.SEL_LAST)
+                self.master.clipboard_clear()
+                self.master.clipboard_append(selected)
+            except tk.TclError:
+                pass  # Nothing selected
+
+        def do_select_all():
+            self.chat_display.tag_add(tk.SEL, '1.0', tk.END)
+            self.chat_display.mark_set(tk.INSERT, '1.0')
+            self.chat_display.see(tk.INSERT)
+
+        menu.add_command(label='Copy', command=do_copy)
+        menu.add_separator()
+        menu.add_command(label='Select All', command=do_select_all)
+
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _show_entry_context_menu(self, event):
+        """Right-click menu for the message Entry (cut / copy / paste / select-all)."""
+        menu = self._make_context_menu()
+
+        def do_cut():
+            try:
+                selected = self.message_entry.selection_get()
+                self.master.clipboard_clear()
+                self.master.clipboard_append(selected)
+                self.message_entry.delete(tk.SEL_FIRST, tk.SEL_LAST)
+            except tk.TclError:
+                pass
+
+        def do_copy():
+            try:
+                selected = self.message_entry.selection_get()
+                self.master.clipboard_clear()
+                self.master.clipboard_append(selected)
+            except tk.TclError:
+                pass
+
+        def do_paste():
+            try:
+                text = self.master.clipboard_get()
+                # Insert at cursor, replacing any active selection
+                try:
+                    self.message_entry.delete(tk.SEL_FIRST, tk.SEL_LAST)
+                except tk.TclError:
+                    pass
+                self.message_entry.insert(tk.INSERT, text)
+            except tk.TclError:
+                pass
+
+        def do_select_all():
+            self.message_entry.select_range(0, tk.END)
+            self.message_entry.icursor(tk.END)
+
+        menu.add_command(label='Cut',        command=do_cut)
+        menu.add_command(label='Copy',       command=do_copy)
+        menu.add_command(label='Paste',      command=do_paste)
+        menu.add_separator()
+        menu.add_command(label='Select All', command=do_select_all)
+
+        # Focus the entry so clipboard operations target it
+        self.message_entry.focus_set()
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    # ------------------------------------------------------------------ #
 
     def send_message_event(self, event):
         self.send_message()
