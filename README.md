@@ -9,7 +9,7 @@
 Black Glass is a new chat viewer for Second Life, boasting a multi client login functionality.
 It allows for local chat and teleportation (both by double clicking the minimap as to another region).
 
-Download and run the .exe file on the right in Releases to help test and improve this project!
+Download and run the .zip release for your operating system on the right in Releases to help test and improve this project!
 ###
 
 ###
@@ -83,7 +83,7 @@ pip install Pillow
 Standard Libraries: tkinter, socket, threading, xmlrpc.
 
 # 🚀 Getting Started
-Download and run the .exe file in Releases or clone the repository or download BlackGlass.py.
+Download and run the .zip release for your operating system in Releases or clone the repository or download BlackGlass.py.
 ###
 ###
 Run the script:
@@ -100,3 +100,8 @@ Used early draft version of following library >>> https://github.com/FelixWolf/p
 
 # ⚖️ Disclaimer
 BlackGlass is an independent project and is not affiliated with, endorsed by, or sponsored by Linden Research (Linden Lab). Use this client at your own risk and ensure compliance with the Second Life Terms of Service.
+
+## 📦 Installation
+
+You can download the compiled standalone release for your operating system (Windows, macOS, or Linux) directly from the **[Releases](../../releases)** tab. No Python installation is required! Just download the .zip for your OS, extract, and run.
+
