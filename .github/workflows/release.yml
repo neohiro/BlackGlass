@@ -45,19 +45,19 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: |
           pyinstaller --noconfirm --onedir --windowed --icon=BlackGlass.ico BlackGlass.py
-          Compress-Archive -Path "dist\BlackGlass\*" -DestinationPath "BlackGlass-Windows.zip" -Force
+          Compress-Archive -Path "dist\BlackGlass" -DestinationPath "BlackGlass-Windows.zip" -Force
 
       - name: Build macOS Executable
         if: matrix.os == 'macos-latest'
         run: |
-          pyinstaller --noconfirm --onedir --windowed --icon=BlackGlass.ico BlackGlass.py
+          pyinstaller --noconfirm --onedir --windowed --icon=BlackGlass.icns BlackGlass.py
           cd dist
           zip -r ../BlackGlass-macOS.zip BlackGlass.app
 
       - name: Build Linux Executable
         if: matrix.os == 'ubuntu-latest'
         run: |
-          pyinstaller --noconfirm --onedir --windowed --icon=BlackGlass.ico BlackGlass.py
+          pyinstaller --noconfirm --onedir --windowed --icon=BlackGlass.png BlackGlass.py
           cd dist
           zip -r ../BlackGlass-Linux.zip BlackGlass
 
