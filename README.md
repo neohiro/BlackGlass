@@ -1,5 +1,9 @@
 # BlackGlass 1.4
 
+[![Python 3.7+](https://img.shields.io/badge/python-3.7+-blue.svg)](https://www.python.org/downloads/)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgray.svg)](https://github.com/)
+[![Build Status](https://github.com/neohiro/BlackGlass/actions/workflows/release.yml/badge.svg)](https://github.com/neohiro/BlackGlass/actions)
+
 <img width="256" height="256" alt="image" src="https://github.com/user-attachments/assets/0bfe5e2b-0043-466c-afc4-141d5138b68d" />
 
 Black Glass is a new chat viewer for Second Life, boasting a multi client login functionality.
