@@ -22,11 +22,11 @@ Requires Python 3.7+; Pillow is optional (map tiles degrade gracefully without i
 
 ```
 blackglass/
-├── lltypes / codec / messages / packet   # protocol stack
-├── network                               # login, circuits, LLSD
-├── agent                                 # SecondLifeAgent session logic
-├── credentials                           # local profile storage
-└── ui/                                   # widgets, theme, minimap, chat, login, app
+Γö£ΓöÇΓöÇ lltypes / codec / messages / packet   # protocol stack
+Γö£ΓöÇΓöÇ network                               # login, circuits, LLSD
+Γö£ΓöÇΓöÇ agent                                 # SecondLifeAgent session logic
+Γö£ΓöÇΓöÇ credentials                           # local profile storage
+ΓööΓöÇΓöÇ ui/                                   # widgets, theme, minimap, chat, login, app
 ```
 
 Protocol layers must never import UI code. A great first contribution is a
@@ -43,3 +43,11 @@ file under `ui/`.
 ## Contact
 
 [frenzypenguin.media](https://linktr.ee/frenzypenguin.media)
+
+## Releasing
+
+1. Bump the version (code constant / README).
+2. Commit and push.
+3. **Draft a new Release** on GitHub with tag `vX.Y.Z` and publish it - CI
+   builds every platform binary automatically and attaches them; release
+   notes are generated from merged commits since the last tag.
