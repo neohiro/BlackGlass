@@ -3,6 +3,7 @@
 [![Python 3.7+](https://img.shields.io/badge/python-3.7+-blue.svg)](https://www.python.org/downloads/)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgray.svg)](https://github.com/)
 [![Build Status](https://github.com/neohiro/BlackGlass/actions/workflows/release.yml/badge.svg)](https://github.com/neohiro/BlackGlass/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 <img width="256" height="256" alt="image" src="https://github.com/user-attachments/assets/0bfe5e2b-0043-466c-afc4-141d5138b68d" />
 
@@ -10,15 +11,11 @@ Black Glass is a new chat viewer for Second Life, boasting a multi client login 
 It allows for local chat and teleportation (both by double clicking the minimap as to another region).
 
 Download and run the .zip release for your operating system on the right in Releases to help test and improve this project!
-###
-
-###
 
 Black Glass is a lightweight, high-performance Second Life client focused on multi-avatar chat management, navigation, and regional awareness. Built with a "Black Glass" aesthetic using Python and Tkinter, it provides a streamlined alternative to heavy 3D viewers for users who prioritize local communication and efficiency.
 
-# 🚀Features 
-###
-###
+## 🚀 Features
+
 ## Updates
 
 1.4: URI namespaces are now resolved; groups, parcels and profiles are accessible in the viewer.
@@ -78,28 +75,66 @@ Download and run the .exe compile at Releases or use Python: 3.7+
 
 Pillow (PIL): Required for minimap image rendering.
 
-pip install Pillow
+pip install -r requirements.txt
 
 Standard Libraries: tkinter, socket, threading, xmlrpc.
 
 # 🚀 Getting Started
-Download and run the .zip release for your operating system in Releases or clone the repository or download BlackGlass.py.
-###
-###
-Run the script:
-###
-python BlackGlass.py
-###
+Download and run the .zip release for your operating system in Releases, or run from source:
+
+    git clone https://github.com/neohiro/BlackGlass.git
+    cd BlackGlass
+    pip install -r requirements.txt
+    python BlackGlass.py
+
 Login: Enter your avatar's First Name, Last Name, and Password.
 Set the Start Region to last, home, or a specific region name.
-###
+
 Manage Profiles: Your credentials will be saved automatically for quick access in the "Saved Profile" dropdown.
+
+# 🧩 Architecture
+
+The codebase is organised as a package so it is easy to navigate and contribute to:
+
+```
+BlackGlass.py            # thin launcher (python BlackGlass.py)
+blackglass/
+├── lltypes.py           # wire-format data types (vectors, quaternions, LLUUID, ...)
+├── codec.py             # typed encode/decode, zerocoding, hex dumps
+├── messages.py          # SL message templates + message registry
+├── packet.py            # UDP packet framing & reliability (ACKs)
+├── network.py           # login, region circuits (RegionClient), LLSD helpers
+├── agent.py             # SecondLifeAgent — high-level session behaviour
+├── credentials.py       # local profile storage
+├── imaging.py           # optional Pillow support flag
+└── ui/
+    ├── widgets.py       # LimitedScrolledText (memory-safe chat log)
+    ├── theme.py         # themed dialogs & image panels
+    ├── minimap.py       # MinimapCanvas radar
+    ├── chat.py          # ChatTab — per-session chat UI
+    ├── login.py         # LoginPanel with saved profiles
+    └── app.py           # MultiClientApp main window
+```
+
+Protocol layers never import UI code; `ui/` sits on top of the `agent` API. A good first contribution is often a new message template in `messages.py` or a UI improvement in one tab file.
+
+## 🤝 Contributing
+
+Issues and pull requests are welcome! For code changes:
+
+1. Fork & create a branch.
+2. Keep changes focused; test against the live grid where possible.
+3. Run `python BlackGlass.py` from source to verify before opening a PR.
 
 # 🪙 Credits
 Used early draft version of following library >>> https://github.com/FelixWolf/pymetaverse/tree/master
 
 # ⚖️ Disclaimer
 BlackGlass is an independent project and is not affiliated with, endorsed by, or sponsored by Linden Research (Linden Lab). Use this client at your own risk and ensure compliance with the Second Life Terms of Service.
+
+## 📄 License
+
+Released under the [MIT License](LICENSE).
 
 ## 📦 Installation
 
