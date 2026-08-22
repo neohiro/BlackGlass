@@ -1,0 +1,51 @@
+name: Bug report
+description: Report something broken
+labels: [bug]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Also tell us what you expected to happen instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Launch ...
+        2. Click ...
+        3. See error
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows 11
+        - Windows 10
+        - Linux (please specify in description)
+        - macOS
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: How are you running it?
+      options:
+        - Latest release download
+        - Run from source
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: App version / release tag
+      placeholder: v1.6.0
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: Attach anything that helps. Remove personal data first.
