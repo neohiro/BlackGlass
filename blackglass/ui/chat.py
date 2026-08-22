@@ -926,6 +926,7 @@ class ChatTab(ttk.Frame):
 
     # Sentinel pattern: \x02R:<type>:<uuid>\x03  (type = agent | group | parcel)
     _SENTINEL_RE = re.compile(r'\x02R:(agent|group|parcel):([0-9a-f\-]{36})\x03')
+    _TP_RE = re.compile(r'\[Teleport to:\s*([^\]]+)\]', re.I)
 
     # Regex for http/https URLs AND bare www. URLs.
     # www. branch: requires www. + hostname label(s) + '.' + TLD (>=2 letters),
@@ -943,6 +944,51 @@ class ChatTab(ttk.Frame):
         and rendering them as clickable cyan underlined hyperlinks.
         *base_tags* is a tuple of any already-active tags to apply to plain text.
         """
+        # Teleport spans first so their text is not treated as plain content
+        tp_parts = self._TP_RE.split(chunk)
+        if len(tp_parts) > 1:
+            i = 0
+            while i < len(tp_parts):
+                if tp_parts[i]:
+                    self._insert_chunk_with_links_plain(tp_parts[i], base_tags)
+                i += 1
+                if i < len(tp_parts):
+                    self._insert_teleport_span(tp_parts[i], base_tags)
+                    i += 1
+            return
+        self._insert_chunk_with_links_plain(chunk, base_tags)
+
+    def _insert_teleport_span(self, spec, base_tags):
+        """Render '[Teleport to: Region (X/Y/Z)]' as a clickable in-session TP."""
+        spec = spec.strip()
+        m = re.match(r"^(.*?)\s*\((\d+)[/,]\s*(\d+)[/,]\s*(\d+)\)$", spec)
+        if m:
+            region = m.group(1).strip()
+            coords = tuple(int(m.group(n)) for n in (2, 3, 4))
+        else:
+            region, coords = spec, (128, 128, 25)
+        self._link_counter += 1
+        tag = f'tplink_{self._link_counter}'
+        self.chat_display.tag_config(tag, foreground='#00FFAA', underline=True)
+        self.chat_display.tag_bind(
+            tag, '<Button-1>',
+            lambda e, r=region, c=coords: self._click_teleport(r, c))
+        self.chat_display.tag_bind(tag, '<Enter>',
+                                    lambda e: self.chat_display.config(cursor='hand2'))
+        self.chat_display.tag_bind(tag, '<Leave>',
+                                   lambda e: self.chat_display.config(cursor=''))
+        self.chat_display.insert(tk.END, f"[Teleport to: {spec}]",
+                                 (tag, 'hyperlink') + base_tags)
+
+    def _click_teleport(self, region, coords):
+        def worker():
+            try:
+                self.sl_agent.soft_teleport(region, *coords)
+            except Exception as exc:
+                self.update_ui("notification", f"[ERROR] Teleport failed: {exc}")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _insert_chunk_with_links_plain(self, chunk, base_tags):
         segments = self._URL_RE.split(chunk)
         urls = self._URL_RE.findall(chunk)
 

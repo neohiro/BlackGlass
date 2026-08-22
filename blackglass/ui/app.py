@@ -7,6 +7,7 @@ from tkinter import ttk
 from ..agent import SecondLifeAgent
 from ..credentials import CREDENTIALS_FILE
 from .chat import ChatTab
+from .lists import ListsTab
 from .login import LoginPanel
 from .theme import ThemedMessageBox
 
@@ -143,8 +144,11 @@ class MultiClientApp(tk.Tk):
         chat_tab = ChatTab(self.notebook, agent, first, last, self)
         tab_name = f"{first} {last}".replace(" Resident", "")
         
-        # 2. Add to notebook and select it
+        # 2. Add to notebook and select it (+ per-user Lists tab)
         self.notebook.add(chat_tab, text=tab_name)
+        lists_tab = ListsTab(self.notebook, chat_tab, self)
+        self.notebook.insert(chat_tab, lists_tab, text=f"☷ {tab_name}")
+        chat_tab.lists_tab = lists_tab
         self.notebook.select(chat_tab)
         
         # 3. Store the active agent
@@ -164,6 +168,17 @@ class MultiClientApp(tk.Tk):
             # The agent is already stopped by the ChatTab.on_closing logic, 
             # but ensure it's removed from the dictionary.
             del self.active_agents[full_name]
+            lists_tab = getattr(chat_tab_instance, "lists_tab", None)
+            if lists_tab is not None:
+                try:
+                    lists_tab.cancel_refresh()
+                except Exception:
+                    pass
+                try:
+                    self.notebook.forget(lists_tab)
+                    lists_tab.destroy()
+                except Exception:
+                    pass
             self.notebook.forget(chat_tab_instance)
             
             # Select the "New Login" tab if it exists

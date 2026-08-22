@@ -479,7 +479,7 @@ class ThemedParcelDialog(Toplevel):
                 x, y, z = parts[0], parts[1], parts[2] + 1  # +1 to avoid floor clip
             except Exception:
                 x, y, z = 128, 128, 30
-            self.chat_tab.sl_agent.hard_teleport(r, x, y, z)
+            self.chat_tab.sl_agent.soft_teleport(r, x, y, z)
             self.on_close()
 
         tp_btn = ttk.Button(btn_row, text='Teleport To', width=14,
@@ -623,7 +623,7 @@ class ThemedProfileDialog(Toplevel):
             link_url = match.group(0)
             txt.tag_add(tag_name, start_idx, end_idx)
             txt.tag_config(tag_name, foreground='#00FFFF', underline=True)
-            txt.tag_bind(tag_name, '<Button-1>', lambda e, u=link_url: os.startfile(u))
+            txt.tag_bind(tag_name, '<Button-1>', lambda e, u=link_url: __import__('webbrowser').open(u))
             txt.tag_bind(tag_name, '<Enter>',   lambda e: txt.config(cursor='hand2'))
             txt.tag_bind(tag_name, '<Leave>',   lambda e: txt.config(cursor='arrow'))
         
@@ -637,7 +637,7 @@ class ThemedProfileDialog(Toplevel):
              ttk.Label(right_frame, text="Web Profile:", style='BlackGlass.TLabel', font=('Helvetica', 10, 'bold')).pack(anchor='w')
              link = ttk.Label(right_frame, text=url, style='BlackGlass.TLabel', foreground='#00FFFF', cursor="hand2")
              link.pack(anchor='w', padx=5)
-             link.bind("<Button-1>", lambda e: os.startfile(url))
+             link.bind("<Button-1>", lambda e: __import__('webbrowser').open(url))
         
         # Status / Fetch progress
         source = self.data.get('source', 'UDP')

@@ -18,6 +18,10 @@ Black Glass is a lightweight, high-performance Second Life client focused on mul
 
 ## Updates
 
+1.6: In-session teleporting everywhere - minimap double-clicks, the Teleport button, parcel modals and clickable `[Teleport to: ...]` chat links now move you without relogging (quick logout-login stays as automatic failover). New per-user **Lists tab** (contacts, groups, chats). Long-session memory hardening: bounded caches, stale-avatar pruning. On Windows, saved credentials are now sealed with **DPAPI**.
+
+1.5: Multi-client login; minimap radar with map tiles.
+
 1.4: URI namespaces are now resolved; groups, parcels and profiles are accessible in the viewer.
 
 1.3: You can find a list of Nearby Avatars in which you can select each one for a "Teleport To" or "Profile" option.

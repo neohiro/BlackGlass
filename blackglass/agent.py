@@ -18,6 +18,25 @@ from .network import (RegionClient, SL_USER_AGENT, login_to_simulator,
                       parse_llsd_xml, render_llsd_xml, safe_decode_llvariable)
 
 
+class BoundedDict(dict):
+    """FIFO-bounded dict used for long-running session caches.
+
+    Long sessions previously grew these dictionaries without limit; entries
+    are evicted oldest-first once *maxsize* is exceeded.
+    """
+    def __init__(self, maxsize=2000):
+        super().__init__()
+        self._max = maxsize
+
+    def __setitem__(self, key, value):
+        if len(self) >= self._max and key not in self:
+            try:
+                self.pop(next(iter(self)))
+            except Exception:
+                pass
+        dict.__setitem__(self, key, value)
+
+
 class SecondLifeAgent:
     """Manages the connection and interaction with the Second Life grid."""
     def __init__(self, ui_callback, debug_callback=None):
@@ -29,19 +48,19 @@ class SecondLifeAgent:
         self.current_region_name = ""
         
         # NEW: Display Name and Username Caching
-        self.display_name_cache = {} # UUID -> DisplayName
-        self.username_cache = {}     # UUID -> Username (e.g. 'sarahlionheart')
+        self.display_name_cache = BoundedDict(2000) # UUID -> DisplayName
+        self.username_cache = BoundedDict(2000)   # UUID -> Username (e.g. 'sarahlionheart')
         self.fetching_names = set() # Set of UUIDs currently being fetched
         self.pending_profile_fetches = set() # UUIDs waiting for usernames to fetch web profiles
 
         # Group Name Caching
-        self.group_name_cache = {}   # UUID -> group name string
-        self.group_data_cache = {}   # UUID -> full group data dict
+        self.group_name_cache = BoundedDict(1000)  # UUID -> group name string
+        self.group_data_cache = BoundedDict(500)   # UUID -> full group data dict
         self.fetching_groups = set() # group UUIDs currently being fetched
 
         # Parcel Name Caching
-        self.parcel_name_cache = {}   # UUID -> parcel name string
-        self.parcel_data_cache = {}  # UUID -> full parcel data dict
+        self.parcel_name_cache = BoundedDict(1000) # UUID -> parcel name string
+        self.parcel_data_cache = BoundedDict(500)  # UUID -> full parcel data dict
         self.fetching_parcels = set() # parcel UUIDs currently being fetched
         
         # Connection credentials
@@ -153,6 +172,28 @@ class SecondLifeAgent:
                     self.ui_callback("progress", ("CompleteAgentMovement", 50))
                     self.client.send_complete_movement()
             
+            # --- Periodic cache hygiene (long-session memory control) -------
+            if current_time - getattr(self, "_last_cache_sweep", 0) > 60.0:
+                self._last_cache_sweep = current_time
+                try:
+                    if self.client:
+                        ta = self.client.tracked_avatars
+                        now_ts = time.time()
+                        stale = [u for u, info in list(ta.items())
+                                 if now_ts - info.get("last_seen", 0) > 900]
+                        for u in stale:
+                            ta.pop(u, None)
+                        if len(ta) > 500:  # hard cap: drop oldest sightings
+                            for u in sorted(ta, key=lambda k: ta[k].get("last_seen", 0))[:len(ta) - 500]:
+                                ta.pop(u, None)
+                except Exception:
+                    pass
+                for fetch_set in (self.fetching_names, self.pending_profile_fetches,
+                                  getattr(self, "fetching_groups", set()),
+                                  getattr(self, "fetching_parcels", set())):
+                    if len(fetch_set) > 800:
+                        fetch_set.clear()
+
             # --- Resend Reliable Packets ---
             if self.client.handshake_complete:
                 resend_list = []
@@ -181,8 +222,8 @@ class SecondLifeAgent:
             # Remove packets older than 60 seconds to prevent memory leaks/unbounded growth
             # if the server stops ACking them.
             if len(self.client.reliable_packets) > 0:
-                 # Check periodically (every 5 seconds roughly, based on iteration count or just random)
-                 if random.random() < 0.05: 
+                 if current_time - getattr(self, "_last_packet_prune", 0) > 10.0:
+                     self._last_packet_prune = current_time
                      cutoff = current_time - 60.0
                      # Find expired keys
                      expired = [sid for sid, (_, ts) in self.client.reliable_packets.items() if ts < cutoff]
