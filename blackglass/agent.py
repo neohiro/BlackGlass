@@ -12,7 +12,7 @@ import urllib.parse
 import urllib.request
 
 from .imaging import PIL_AVAILABLE
-from .lltypes import LLUUID, const, variable
+from .lltypes import LLUUID, const, variable, vector3
 from .messages import getMessageByName
 from .network import (RegionClient, SL_USER_AGENT, login_to_simulator,
                       parse_llsd_xml, render_llsd_xml, safe_decode_llvariable)
@@ -304,25 +304,35 @@ class SecondLifeAgent:
                 # --- General Connection Messages ---
                 elif packet_name == "TeleportFinish":
                     # Update coordinates from the handle
-                    if hasattr(packet.body, 'Info'):
-                        handle = packet.body.Info.get("RegionHandle", 0)
-                        if handle:
-                            # Handle is a 64-bit int: y grid (in meters) << 32 | x grid (in meters)
-                            w_y = handle >> 32
-                            w_x = handle & 0xFFFFFFFF
-                            self.client.grid_x = w_x // 256
-                            self.client.grid_y = w_y // 256
-                            self.log(f"TeleportFinish: Updated grid coords to {self.client.grid_x}, {self.client.grid_y}")
+                    info = getattr(packet.body, 'Info', {})
+                    handle = info.get("RegionHandle", 0)
+                    if handle:
+                        # Handle is a 64-bit int: y grid (in meters) << 32 | x grid (in meters)
+                        w_y = handle >> 32
+                        w_x = handle & 0xFFFFFFFF
+                        self.client.grid_x = w_x // 256
+                        self.client.grid_y = w_y // 256
+                        self.log(f"TeleportFinish: Updated grid coords to {self.client.grid_x}, {self.client.grid_y}")
 
-                    self.ui_callback("status", "🚀 Teleport finished! Starting handshake in new region...")
-                    # The network thread will now start the handshake process with the new region.
-                    # Clear handshake state to trigger new handshake process
-                    self.client.handshake_complete = False 
-                    self.client.last_circuit_send = 0
-                    self.client.circuit_packet = None
-                    self.client.cam_packet = None
-                    self.client.controls = 0
-                    self.client.controls_once = 0
+                    # pymetaverse-style landing: point the existing circuit at the new
+                    # simulator (SimIP/SimPort); the run loop then redoes UseCircuitCode +
+                    # CompleteAgentMovement and answers the new RegionHandshake itself.
+                    sim_ip = info.get("SimIP")
+                    sim_port = info.get("SimPort")
+                    seed_cap = info.get("SeedCapability")
+                    if sim_ip is not None and sim_port:
+                        if self.client.retarget(sim_ip, sim_port):
+                            if seed_cap:
+                                self.client.seed_cap_url = safe_decode_llvariable(seed_cap)
+                                self.client.capabilities = {}
+                            self.ui_callback("status", "?? Arrived in region - completing move...")
+                        else:
+                            self.ui_callback("status", "? Could not reach destination sim; use /relog if stuck.")
+                    else:
+                        # Legacy path: no address in packet; reset handshake state anyway.
+                        self.client.handshake_complete = False
+                        self.client.last_circuit_send = 0
+                        self.ui_callback("status", "dYs? Teleport finished! Starting handshake in new region...")
 
                 elif packet_name == "CloseCircuit":
                     self.ui_callback("status", "👋 Disconnected from the grid.")
@@ -1455,6 +1465,71 @@ class SecondLifeAgent:
             return None
             
 
+
+    def soft_teleport(self, region_name, x=128, y=128, z=25, timeout=60.0):
+        """
+        In-session teleport using TeleportLocationRequest (no relog).
+
+        Sequence: resolve region name -> send TeleportLocationRequest -> the sim
+        answers TeleportStart/Progress and finally TeleportFinish, whose SimIP/
+        SimPort are used to retarget the circuit (see RegionClient.retarget).
+
+        The original quick logout-login method is kept as backup: if the lookup,
+        the request or the landing fails/times out, hard_teleport() takes over.
+        """
+        region_name = str(region_name).strip()
+        if not region_name:
+            return False
+
+        if not (self.running and self.client and self.client.handshake_complete):
+            self.log("Soft teleport unavailable - not connected; using hard teleport.")
+            return self.hard_teleport(region_name, x, y, z)
+
+        # 1. Resolve the region name to a grid handle
+        self.ui_callback("status", f"🔎 Looking up '{region_name}'...")
+        try:
+            handle = self.client.lookup_region_handle(region_name)
+        except Exception as e:
+            self.log(f"Region lookup error: {e}")
+            handle = None
+        if not handle:
+            self.ui_callback("status", f"❌ Region '{region_name}' not found on the map.")
+            return False
+
+        # 2. Ask the current simulator to move us
+        pos_x = float(x) % 256.0
+        pos_y = float(y) % 256.0
+        pos_z = max(0.0, min(float(z), 4096.0))
+        msg = getMessageByName("TeleportLocationRequest")
+        msg.AgentData["AgentID"] = self.client.agent_id
+        msg.AgentData["SessionID"] = self.client.session_id
+        msg.Info["RegionHandle"] = handle
+        msg.Info["Position"] = vector3(pos_x, pos_y, pos_z)
+        msg.Info["LookAt"] = vector3(pos_x + 1.0, pos_y, pos_z)
+
+        self.client.teleport_failed_at = 0.0   # arm failure detector for this attempt
+        self.client.send(msg, reliable=True)
+        self.log(f"Soft teleport requested -> '{region_name}' <{pos_x:.1f},{pos_y:.1f},{pos_z:.1f}>")
+        self.ui_callback("status", f"🔄 Teleporting to {region_name} ({pos_x:.0f}, {pos_y:.0f})...")
+
+        # 3. Watch for completion or failure; fall back on trouble
+        start = time.time()
+        base_addr = (self.client.host, self.client.port)
+        while time.time() - start < timeout:
+            failed_at = getattr(self.client, "teleport_failed_at", 0.0)
+            if failed_at >= start - 1.0:
+                reason = getattr(self.client, "teleport_fail_reason", "unknown")
+                self.log(f"Soft teleport failed: {reason} - falling back to relog.")
+                self.ui_callback("status", f"❌ Teleport failed ({reason}). Falling back to relog...")
+                break
+            if self.client.handshake_complete and (self.client.host, self.client.port) != base_addr:
+                self.ui_callback("status", f"✅ Arrived in {self.current_region_name or region_name}.")
+                return True
+            time.sleep(1.0)
+
+        # Failover: quick logout-login (original method kept as backup)
+        self.log("Soft teleport did not complete in time - falling back to hard teleport.")
+        return self.hard_teleport(region_name, x, y, z)
 
     def hard_teleport(self, region_name, x=128, y=128, z=30):
         """

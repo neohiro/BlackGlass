@@ -226,8 +226,72 @@ class RegionClient:
         msg.Teleport["LicenseAccepted"] = license
         msg.Teleport["L$Cost"] = cost
         # TeleportAccept must be reliable, sending directly via send will use the new logic
-        self.send(msg, reliable=True) 
+        self.send(msg, reliable=True)
         return True
+
+    def retarget(self, ip_addr, port):
+        """Re-point this UDP circuit at a new simulator in-session.
+
+        Used on TeleportFinish (pymetaverse-style): UDP is connectionless, so
+        switching host/port keeps our bound source port while the handshake
+        restarts automatically - the agent run loop re-sends UseCircuitCode /
+        CompleteAgentMovement whenever self.handshake_complete is False.
+        """
+        try:
+            new_host = str(ip_addr).strip()
+            new_port = int(getattr(port, "port", port))
+            if not new_host or new_port <= 0:
+                return False
+            self.host = new_host
+            self.port = new_port
+            # Reset per-region session state so the run loop redoes the handshake.
+            self.handshake_complete = False
+            self.last_circuit_send = 0
+            self.last_cam_send = 0
+            self.circuit_packet = None   # rebuild UseCircuitCode against the new sim
+            self.cam_packet = None       # rebuild CompleteAgentMovement likewise
+            self.controls = 0
+            self.controls_once = 0
+            self.local_id = 0
+            self.seed_cap_url = ""
+            self.capabilities = {}
+            self.teleport_retarget_at = time.time()
+            self.log(f"Circuit re-targeted to {new_host}:{new_port}; restarting handshake")
+            return True
+        except Exception as e:
+            self.log(f"[ERROR] Circuit retarget failed: {e}")
+            return False
+
+    def lookup_region_handle(self, region_name, timeout=10.0):
+        """Resolve a region name to its U64 grid handle via MapNameRequest."""
+        global teleport_lookup_lock, teleport_lookup_event
+        global teleport_lookup_result, teleport_lookup_target_name
+        target = str(region_name).strip().lower()
+        if not target:
+            return None
+        with teleport_lookup_lock:
+            if teleport_lookup_target_name is not None:
+                self.log("Region lookup already in progress.")
+                return None
+            teleport_lookup_target_name = target
+            teleport_lookup_result = None
+            teleport_lookup_event.clear()
+        try:
+            msg = getMessageByName("MapNameRequest")
+            msg.AgentData["AgentID"] = self.agent_id
+            msg.AgentData["SessionID"] = self.session_id
+            msg.RequestData["Name"] = str(region_name).strip()
+            msg.RequestData["Flags"] = 0
+            self.send(msg, reliable=True)
+            if teleport_lookup_event.wait(timeout):
+                result = teleport_lookup_result
+                if result is not None:
+                    return int(result.get("Handle", 0)) or None
+            self.log(f"Region lookup timed out for '{region_name}'.")
+            return None
+        finally:
+            with teleport_lookup_lock:
+                teleport_lookup_target_name = None
 
 
 
@@ -573,6 +637,9 @@ class RegionClient:
         elif pck.body.name == "TeleportFailed":
             reason = getattr(pck.body.Info, 'Reason', b'').decode('utf-8', errors='ignore').strip()
             self.log(f"TeleportFailed: {reason}")
+            # Surface the failure to soft_teleport watchers (timestamp arms the check)
+            self.teleport_failed_at = time.time()
+            self.teleport_fail_reason = reason or "unknown reason"
             # --- END FIX ---
             
         # --- KICKUSER HANDLING (NEW) ---

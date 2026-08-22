@@ -314,9 +314,9 @@ class ChatTab(ttk.Frame):
             if target_uuid in tracked:
                 pos = tracked[target_uuid]["pos"]
                 px, py, pz = pos
-                # Use current region name for hard teleport
+                # Same-region move: in-session teleport with relog failover
                 region = self.sl_agent.current_region_name
-                self.sl_agent.hard_teleport(region, px, py, pz)
+                self.sl_agent.soft_teleport(region, px, py, pz)
             else:
                 self._append_notification(f"[ERROR] Could not find coordinates for {target_name}.")
         
@@ -1222,10 +1222,10 @@ class ChatTab(ttk.Frame):
     def do_teleport(self):
         # MODIFIED: Use ThemedAskString instead of simpledialog.askstring
         region_name = ThemedAskString.askstring(self.master, "Teleport", "Enter the name of the region to teleport to:")
-        
+
         if region_name:
-            # FIX: User requested Hard Teleport as the default for the button
-            self.sl_agent.hard_teleport(region_name.strip())
+            # In-session teleport; falls back to quick relog automatically on failure.
+            self.sl_agent.soft_teleport(region_name.strip())
 
     def on_closing(self):
         """Handles the user-initiated logout."""

@@ -100,8 +100,8 @@ class MinimapCanvas(tk.Canvas):
                      region_name = region_name.replace('\x00', '')
 
         if region_name and region_name.lower() != "home":
-             self.agent.ui_callback("status", f"🏃 Hard Teleport (Relog) to {sim_x:.0f}, {sim_y:.0f}...")
-             self.agent.hard_teleport(region_name, sim_x, sim_y, current_z)
+             # In-session teleport first; hard relog remains as automatic failover.
+             self.agent.soft_teleport(region_name, sim_x, sim_y, current_z)
         else:
              self.agent.ui_callback("status", "❌ Cannot teleport: Unknown region name.")
 
