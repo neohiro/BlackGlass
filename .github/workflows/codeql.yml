@@ -2,10 +2,14 @@ name: CodeQL Security Analysis
 
 on:
   push:
-    branches: [main]
+    branches: ['M3T4P0D.3XPL01T']
     paths-ignore: ['**.md', '**.txt']
   schedule:
     - cron: '0 6 * * 1'
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   security-events: write
@@ -14,16 +18,16 @@ permissions:
 jobs:
   analyze:
     name: Analyze (python)
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@v4
         with:
           languages: python
           queries: security-extended
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@v4
