@@ -2,7 +2,7 @@ name: CodeQL Security Analysis
 
 on:
   push:
-    branches: ['M3T4P0D.3XPL01T']
+    branches: [main]
     paths-ignore: ['**.md', '**.txt']
   schedule:
     - cron: '0 6 * * 1'
